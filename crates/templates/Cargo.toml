@@ -1,0 +1,14 @@
+[package]
+name = "vibetex-templates"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vibetex-core.workspace = true
+zip.workspace = true
+walkdir.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+thiserror.workspace = true

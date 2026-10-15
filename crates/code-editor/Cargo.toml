@@ -1,0 +1,13 @@
+[package]
+name = "vibetex-code-editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vibetex-core.workspace = true
+gtk4.workspace = true
+sourceview5.workspace = true
+glib.workspace = true
+thiserror.workspace = true

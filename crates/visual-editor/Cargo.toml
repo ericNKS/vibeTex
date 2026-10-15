@@ -1,0 +1,16 @@
+[package]
+name = "vibetex-visual-editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vibetex-core.workspace = true
+vibetex-latex-parser.workspace = true
+vibetex-document-model.workspace = true
+gtk4.workspace = true
+libadwaita.workspace = true
+pango.workspace = true
+glib.workspace = true
+thiserror.workspace = true

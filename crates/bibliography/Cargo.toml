@@ -1,0 +1,12 @@
+[package]
+name = "vibetex-bibliography"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vibetex-core.workspace = true
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true

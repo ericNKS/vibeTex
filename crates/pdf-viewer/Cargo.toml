@@ -1,0 +1,15 @@
+[package]
+name = "vibetex-pdf-viewer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vibetex-core.workspace = true
+gtk4.workspace = true
+cairo-rs.workspace = true
+poppler-rs.workspace = true
+gdk4.workspace = true
+glib.workspace = true
+thiserror.workspace = true

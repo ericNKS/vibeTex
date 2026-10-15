@@ -1,0 +1,33 @@
+[package]
+name = "vibetex-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vibetex"
+path = "src/main.rs"
+
+[dependencies]
+vibetex-core.workspace = true
+vibetex-latex-parser.workspace = true
+vibetex-document-model.workspace = true
+vibetex-compiler.workspace = true
+vibetex-pdf-viewer.workspace = true
+vibetex-bibliography.workspace = true
+vibetex-templates.workspace = true
+vibetex-workspace.workspace = true
+vibetex-code-editor.workspace = true
+vibetex-visual-editor.workspace = true
+
+gtk4.workspace = true
+adw = { version = "0.9", package = "libadwaita" }
+sourceview5.workspace = true
+poppler-rs.workspace = true
+glib.workspace = true
+pango.workspace = true
+cairo-rs.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+async-channel = "2.3"

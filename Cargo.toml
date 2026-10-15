@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/latex-parser",
+    "crates/document-model",
+    "crates/compiler",
+    "crates/pdf-viewer",
+    "crates/bibliography",
+    "crates/templates",
+    "crates/workspace",
+    "crates/code-editor",
+    "crates/visual-editor",
+    "crates/ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["VibeTeX Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vibetex/vibetex"
+
+[workspace.dependencies]
+vibetex-core = { path = "crates/core" }
+vibetex-latex-parser = { path = "crates/latex-parser" }
+vibetex-document-model = { path = "crates/document-model" }
+vibetex-compiler = { path = "crates/compiler" }
+vibetex-pdf-viewer = { path = "crates/pdf-viewer" }
+vibetex-bibliography = { path = "crates/bibliography" }
+vibetex-templates = { path = "crates/templates" }
+vibetex-workspace = { path = "crates/workspace" }
+vibetex-code-editor = { path = "crates/code-editor" }
+vibetex-visual-editor = { path = "crates/visual-editor" }
+
+gtk4 = "0.11"
+libadwaita = "0.9"
+sourceview5 = "0.11"
+poppler-rs = "0.26"
+cairo-rs = "0.22"
+pango = "0.22"
+gdk4 = "0.11"
+glib = "0.22"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+regex = "1.11"
+tempfile = "3.17"
+walkdir = "2.5"
+zip = "2.2"
