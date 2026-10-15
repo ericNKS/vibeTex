@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use adw::{ActionRow, ApplicationWindow, HeaderBar, Toast, ToastOverlay, ViewStack, ViewSwitcher};
-use gtk4::{Box, Button, Label, ListBox, Orientation, Paned, ScrolledWindow, Separator, Spinner, Stack};
-use std::cell::RefCell;
+use gtk4::{Box, Button, Label, ListBox, Orientation, Paned, ScrolledWindow, Separator, Spinner, ToggleButton};
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -37,7 +37,7 @@ pub struct AppWindow {
     status_label: Label,
     spinner: Spinner,
     log_content: Label,
-    _bottom_drawer: Box,
+    btn_auto_compile: ToggleButton,
 }
 
 impl AppWindow {
@@ -52,7 +52,6 @@ impl AppWindow {
         };
 
         let mut bib_index = BibIndex::new();
-        // Auto-load any .bib files in project
         if let Ok(entries) = std::fs::read_dir(&project_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -88,11 +87,14 @@ impl AppWindow {
 
         // HeaderBar
         let header = HeaderBar::new();
-        let title_label = Label::new(Some("VibeTeX"));
-        title_label.add_css_class("title");
-        header.set_title_widget(Some(&title_label));
 
-        // Left Header actions
+        // 1. Left Header actions: Toggle Sidebar, New Project, Save, Undo, Redo
+        let btn_toggle_sidebar = Button::builder()
+            .icon_name("sidebar-show-symbolic")
+            .tooltip_text("Mostrar / Ocultar Barra Lateral")
+            .build();
+        header.pack_start(&btn_toggle_sidebar);
+
         let btn_new_proj = Button::from_icon_name("document-new-symbolic");
         btn_new_proj.set_tooltip_text(Some("Novo Projeto a partir de Template"));
         header.pack_start(&btn_new_proj);
@@ -109,32 +111,40 @@ impl AppWindow {
         btn_redo.set_tooltip_text(Some("Refazer (Ctrl+Y)"));
         header.pack_start(&btn_redo);
 
-        // Center: Mode Switcher (Stack of Editors)
-        let mode_stack = Stack::new();
-        mode_stack.set_vexpand(true);
-        mode_stack.set_hexpand(true);
+        // 2. Center: Linked Mode Switcher [Código] [Visual] [Dividido]
+        // This avoids any reparenting conflicts in GTK4!
+        let mode_box = Box::new(Orientation::Horizontal, 0);
+        mode_box.add_css_class("linked");
 
-        let code_editor = Rc::new(CodeEditorWidget::new());
-        code_editor.set_text_silently(&initial_text);
+        let btn_mode_code = ToggleButton::builder()
+            .label("Código")
+            .icon_name("text-x-generic-symbolic")
+            .tooltip_text("Modo Código LaTeX (Tela Inteira)")
+            .build();
 
-        let visual_editor = Rc::new(VisualEditorWidget::new());
-        visual_editor.render_ast(state.borrow().document.ast(), &initial_text);
+        let btn_mode_visual = ToggleButton::builder()
+            .label("Visual")
+            .icon_name("format-text-bold-symbolic")
+            .tooltip_text("Modo Visual Rico (Tela Inteira)")
+            .build();
 
-        let split_paned = Paned::new(Orientation::Horizontal);
-        split_paned.set_start_child(Some(code_editor.widget()));
-        split_paned.set_end_child(Some(visual_editor.widget()));
-        split_paned.set_position(500);
+        let btn_mode_split = ToggleButton::builder()
+            .label("Dividido")
+            .icon_name("view-dual-symbolic")
+            .tooltip_text("Modo Dividido (Código + Visual Lado a Lado)")
+            .build();
 
-        mode_stack.add_titled(code_editor.widget(), Some("code"), "Código");
-        mode_stack.add_titled(visual_editor.widget(), Some("visual"), "Visual");
-        mode_stack.add_titled(&split_paned, Some("split"), "Código + Visual");
-        mode_stack.set_visible_child_name("split");
+        btn_mode_visual.set_group(Some(&btn_mode_code));
+        btn_mode_split.set_group(Some(&btn_mode_code));
+        btn_mode_split.set_active(true);
 
-        let mode_switcher = gtk4::StackSwitcher::new();
-        mode_switcher.set_stack(Some(&mode_stack));
-        header.set_title_widget(Some(&mode_switcher));
+        mode_box.append(&btn_mode_code);
+        mode_box.append(&btn_mode_visual);
+        mode_box.append(&btn_mode_split);
 
-        // Right Header actions: Compile & Export
+        header.set_title_widget(Some(&mode_box));
+
+        // 3. Right Header actions: Compile, Auto-Compile Switch, Spinner, Export
         let spinner = Spinner::new();
         spinner.set_margin_end(6);
 
@@ -145,20 +155,28 @@ impl AppWindow {
             .css_classes(["suggested-action"])
             .build();
 
+        let btn_auto_compile = ToggleButton::builder()
+            .label("Auto")
+            .active(true)
+            .tooltip_text("Compilação automática contínua ao digitar")
+            .build();
+
         header.pack_end(&btn_compile);
+        header.pack_end(&btn_auto_compile);
         header.pack_end(&spinner);
 
         let btn_export = Button::from_icon_name("emblem-package-symbolic");
-        btn_export.set_tooltip_text(Some("Exportar Projeto para ZIP (compatível com Overleaf)"));
+        btn_export.set_tooltip_text(Some("Exportar Projeto para ZIP"));
         header.pack_end(&btn_export);
 
         main_box.append(&header);
 
-        // Workspace Paned (Left Sidebar vs. Center/Right Content)
+        // 4. Main Workspace Layout
+        // root_paned: [Left Sidebar] <---> [Center/Right Workspace]
         let root_paned = Paned::new(Orientation::Horizontal);
         root_paned.set_vexpand(true);
         root_paned.set_hexpand(true);
-        root_paned.set_position(280);
+        root_paned.set_position(260);
         main_box.append(&root_paned);
 
         // Left Sidebar: Files, Outline, Bibliography
@@ -195,18 +213,29 @@ impl AppWindow {
         sidebar_box.append(&sidebar_stack);
         root_paned.set_start_child(Some(&sidebar_box));
 
-        // Center / Right Paned (Editor Stack vs. PDF Preview)
+        // 5. Center & Right Workspace:
+        // editor_pdf_paned: [Editor Area (Editors + Logs)] <---> [PDF Viewer]
         let editor_pdf_paned = Paned::new(Orientation::Horizontal);
         editor_pdf_paned.set_vexpand(true);
         editor_pdf_paned.set_hexpand(true);
         editor_pdf_paned.set_position(650);
 
-        let editor_container = Box::new(Orientation::Vertical, 0);
-        editor_container.append(&mode_stack);
+        // Editor Split Paned (holds Code Editor and Visual Editor permanently!)
+        let code_editor = Rc::new(CodeEditorWidget::new());
+        code_editor.set_text_silently(&initial_text);
 
-        // Bottom Collapsible Drawer for Logs & Diagnostics
+        let visual_editor = Rc::new(VisualEditorWidget::new());
+        visual_editor.render_ast(state.borrow().document.ast(), &initial_text);
+
+        let split_paned = Paned::new(Orientation::Horizontal);
+        split_paned.set_vexpand(true);
+        split_paned.set_hexpand(true);
+        split_paned.set_start_child(Some(code_editor.widget()));
+        split_paned.set_end_child(Some(visual_editor.widget()));
+        split_paned.set_position(480);
+
+        // 6. Bottom Resizable & Minimizable Logs Drawer
         let bottom_drawer = Box::new(Orientation::Vertical, 0);
-        bottom_drawer.set_size_request(-1, 140);
         bottom_drawer.add_css_class("card");
         bottom_drawer.set_margin_start(8);
         bottom_drawer.set_margin_end(8);
@@ -231,6 +260,12 @@ impl AppWindow {
         btn_clear_logs.set_tooltip_text(Some("Limpar Logs"));
         drawer_header.append(&btn_clear_logs);
 
+        let btn_minimize_drawer = Button::builder()
+            .icon_name("pan-down-symbolic")
+            .tooltip_text("Minimizar / Expandir Painel de Logs")
+            .build();
+        drawer_header.append(&btn_minimize_drawer);
+
         bottom_drawer.append(&drawer_header);
         bottom_drawer.append(&Separator::new(Orientation::Horizontal));
 
@@ -247,9 +282,17 @@ impl AppWindow {
         log_scroll.set_child(Some(&log_content));
         bottom_drawer.append(&log_scroll);
 
-        editor_container.append(&bottom_drawer);
-        editor_pdf_paned.set_start_child(Some(&editor_container));
+        // Vertical Paned allowing the user to drag and adjust logs height!
+        let editor_logs_paned = Paned::new(Orientation::Vertical);
+        editor_logs_paned.set_vexpand(true);
+        editor_logs_paned.set_hexpand(true);
+        editor_logs_paned.set_start_child(Some(&split_paned));
+        editor_logs_paned.set_end_child(Some(&bottom_drawer));
+        editor_logs_paned.set_position(580);
 
+        editor_pdf_paned.set_start_child(Some(&editor_logs_paned));
+
+        // 7. PDF Viewer on the right
         let pdf_viewer = Rc::new(PdfViewerWidget::new());
         editor_pdf_paned.set_end_child(Some(pdf_viewer.widget()));
 
@@ -268,13 +311,32 @@ impl AppWindow {
             status_label,
             spinner,
             log_content,
-            _bottom_drawer: bottom_drawer,
+            btn_auto_compile,
         };
 
         app_win.refresh_file_tree();
         app_win.refresh_outline();
         app_win.refresh_bib_list();
-        app_win.setup_event_handlers(btn_save, btn_compile, btn_undo, btn_redo, btn_new_proj, btn_export, btn_clear_logs);
+
+        app_win.setup_event_handlers(
+            btn_save,
+            btn_compile,
+            btn_undo,
+            btn_redo,
+            btn_new_proj,
+            btn_export,
+            btn_clear_logs,
+            btn_toggle_sidebar,
+            btn_minimize_drawer,
+            sidebar_box,
+            root_paned,
+            split_paned,
+            editor_logs_paned,
+            log_scroll,
+            btn_mode_code,
+            btn_mode_visual,
+            btn_mode_split,
+        );
 
         // Check for pre-existing PDF in .build/ or project root
         let expected_pdf = project_dir.join(".build").join("main.pdf");
@@ -447,83 +509,103 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         btn_new_proj: Button,
         btn_export: Button,
         btn_clear_logs: Button,
+        btn_toggle_sidebar: Button,
+        btn_minimize_drawer: Button,
+        sidebar_box: Box,
+        root_paned: Paned,
+        split_paned: Paned,
+        editor_logs_paned: Paned,
+        log_scroll: ScrolledWindow,
+        btn_mode_code: ToggleButton,
+        btn_mode_visual: ToggleButton,
+        btn_mode_split: ToggleButton,
     ) {
-        // 1. Code Editor -> Document & Visual Editor
-        let state_code = self.state.clone();
-        let visual_code = self.visual_editor.clone();
-        let code_ref = self.code_editor.clone();
+        // --- 1. View Mode Switching (No reparenting! Perfect fullscreen & split) ---
+        let code_widget = self.code_editor.widget().clone();
+        let visual_widget = self.visual_editor.widget().clone();
+        let split_ref = split_paned.clone();
 
-        self.code_editor.buffer().connect_changed(move |buffer| {
-            if code_ref.is_internal_update() {
-                return;
-            }
-            let (start, end) = buffer.bounds();
-            let text = buffer.text(&start, &end, false).to_string();
-
-            let mut st = state_code.borrow_mut();
-            let full_span = vibetex_core::Span::new(0, st.document.source().len());
-            let delta = TextDelta::new(full_span, text.clone(), ChangeOrigin::CodeEditor);
-            let _ = st.document.apply_delta(delta);
-
-            visual_code.render_ast(st.document.ast(), &text);
-        });
-
-        // 2. Visual Editor -> Document & Code Editor
-        let state_vis = self.state.clone();
-        let code_vis = self.code_editor.clone();
-        let visual_self = self.visual_editor.clone();
-
-        self.visual_editor.set_on_delta(move |delta| {
-            let mut st = state_vis.borrow_mut();
-            if let Ok(_) = st.document.apply_delta(delta) {
-                let updated = st.document.source().to_string();
-                code_vis.set_text_silently(&updated);
-                visual_self.render_ast(st.document.ast(), &updated);
+        btn_mode_code.connect_toggled({
+            let code_w = code_widget.clone();
+            let visual_w = visual_widget.clone();
+            move |btn| {
+                if btn.is_active() {
+                    code_w.set_visible(true);
+                    visual_w.set_visible(false);
+                }
             }
         });
 
-        // 3. Save Document
-        let state_save = self.state.clone();
-        let toast_save = self.toast_overlay.clone();
-        btn_save.connect_clicked(move |_| {
-            let mut st = state_save.borrow_mut();
-            let target = st.current_file.clone();
-            let content = st.document.source().as_bytes();
-            if let Ok(_) = ProjectManager::atomic_write(&target, content) {
-                st.document.mark_saved();
-                toast_save.add_toast(Toast::new("Documento salvo com sucesso."));
+        btn_mode_visual.connect_toggled({
+            let code_w = code_widget.clone();
+            let visual_w = visual_widget.clone();
+            move |btn| {
+                if btn.is_active() {
+                    code_w.set_visible(false);
+                    visual_w.set_visible(true);
+                }
+            }
+        });
+
+        btn_mode_split.connect_toggled({
+            let code_w = code_widget.clone();
+            let visual_w = visual_widget.clone();
+            let split_p = split_ref.clone();
+            move |btn| {
+                if btn.is_active() {
+                    code_w.set_visible(true);
+                    visual_w.set_visible(true);
+                    split_p.set_position(500);
+                }
+            }
+        });
+
+        // --- 2. Collapsible Sidebar ---
+        let sidebar_ref = sidebar_box.clone();
+        let root_p_ref = root_paned.clone();
+        btn_toggle_sidebar.connect_clicked(move |_| {
+            let is_vis = sidebar_ref.is_visible();
+            sidebar_ref.set_visible(!is_vis);
+            if !is_vis {
+                root_p_ref.set_position(260);
+            }
+        });
+
+        // Automatically collapse sidebar if dragged very small (< 75px)
+        let sidebar_auto_collapse = sidebar_box.clone();
+        root_paned.connect_position_notify(move |paned| {
+            if paned.position() < 75 && sidebar_auto_collapse.is_visible() {
+                sidebar_auto_collapse.set_visible(false);
+            }
+        });
+
+        // --- 3. Minimizable & Resizable Logs Drawer ---
+        let is_drawer_minimized = Rc::new(Cell::new(false));
+        let saved_drawer_pos = Rc::new(Cell::new(580));
+        let log_scroll_ref = log_scroll.clone();
+        let logs_paned_ref = editor_logs_paned.clone();
+        let btn_min_ref = btn_minimize_drawer.clone();
+
+        btn_minimize_drawer.connect_clicked(move |_| {
+            let is_min = is_drawer_minimized.get();
+            if is_min {
+                // Restore expanded
+                log_scroll_ref.set_visible(true);
+                btn_min_ref.set_icon_name("pan-down-symbolic");
+                btn_min_ref.set_tooltip_text(Some("Minimizar Painel de Logs"));
+                logs_paned_ref.set_position(saved_drawer_pos.get());
+                is_drawer_minimized.set(false);
             } else {
-                toast_save.add_toast(Toast::new("Erro ao salvar documento."));
+                // Minimize to status bar
+                saved_drawer_pos.set(logs_paned_ref.position());
+                log_scroll_ref.set_visible(false);
+                btn_min_ref.set_icon_name("pan-up-symbolic");
+                btn_min_ref.set_tooltip_text(Some("Expandir Painel de Logs"));
+                is_drawer_minimized.set(true);
             }
         });
 
-        // 4. Undo
-        let state_undo = self.state.clone();
-        let code_undo = self.code_editor.clone();
-        let visual_undo = self.visual_editor.clone();
-        btn_undo.connect_clicked(move |_| {
-            let mut st = state_undo.borrow_mut();
-            if let Ok(Some(_)) = st.document.undo() {
-                let text = st.document.source().to_string();
-                code_undo.set_text_silently(&text);
-                visual_undo.render_ast(st.document.ast(), &text);
-            }
-        });
-
-        // 5. Redo
-        let state_redo = self.state.clone();
-        let code_redo = self.code_editor.clone();
-        let visual_redo = self.visual_editor.clone();
-        btn_redo.connect_clicked(move |_| {
-            let mut st = state_redo.borrow_mut();
-            if let Ok(Some(_)) = st.document.redo() {
-                let text = st.document.source().to_string();
-                code_redo.set_text_silently(&text);
-                visual_redo.render_ast(st.document.ast(), &text);
-            }
-        });
-
-        // 6. Compile
+        // --- 4. Compilation Pipeline (Manual + Auto-compile with Debounce) ---
         let state_comp = self.state.clone();
         let pdf_comp = self.pdf_viewer.clone();
         let spinner_comp = self.spinner.clone();
@@ -531,7 +613,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         let log_comp = self.log_content.clone();
         let toast_comp = self.toast_overlay.clone();
 
-        btn_compile.connect_clicked(move |_| {
+        let trigger_compile = Rc::new(move || {
             let (proj_dir, cur_file, content) = {
                 let mut st = state_comp.borrow_mut();
                 if st.is_compiling {
@@ -541,7 +623,6 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                 (st.project_dir.clone(), st.current_file.clone(), st.document.source().to_string())
             };
 
-            // Auto-save before compile
             let _ = ProjectManager::atomic_write(&cur_file, content.as_bytes());
 
             spinner_comp.start();
@@ -620,7 +701,118 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             });
         });
 
-        // 7. Clear Logs
+        // Debounce timer for auto-compilation
+        let compile_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let btn_auto_ref = self.btn_auto_compile.clone();
+        let trigger_auto_compile = {
+            let tc = trigger_compile.clone();
+            let timer_slot = compile_timer.clone();
+            let auto_btn = btn_auto_ref.clone();
+            Rc::new(move || {
+                if !auto_btn.is_active() {
+                    return;
+                }
+                if let Some(src) = timer_slot.borrow_mut().take() {
+                    src.remove();
+                }
+                let tc_run = tc.clone();
+                let src_id = glib::timeout_add_local_once(Duration::from_millis(800), move || {
+                    tc_run();
+                });
+                *timer_slot.borrow_mut() = Some(src_id);
+            })
+        };
+
+        // Manual compile button
+        let tc_manual = trigger_compile.clone();
+        btn_compile.connect_clicked(move |_| {
+            tc_manual();
+        });
+
+        // 5. Code Editor -> Document, Visual Editor & Auto-Compile
+        let state_code = self.state.clone();
+        let visual_code = self.visual_editor.clone();
+        let code_ref = self.code_editor.clone();
+        let auto_comp_code = trigger_auto_compile.clone();
+
+        self.code_editor.buffer().connect_changed(move |buffer| {
+            if code_ref.is_internal_update() {
+                return;
+            }
+            let (start, end) = buffer.bounds();
+            let text = buffer.text(&start, &end, false).to_string();
+
+            let mut st = state_code.borrow_mut();
+            let full_span = vibetex_core::Span::new(0, st.document.source().len());
+            let delta = TextDelta::new(full_span, text.clone(), ChangeOrigin::CodeEditor);
+            let _ = st.document.apply_delta(delta);
+
+            visual_code.render_ast(st.document.ast(), &text);
+            auto_comp_code();
+        });
+
+        // 6. Visual Editor -> Document, Code Editor & Auto-Compile
+        let state_vis = self.state.clone();
+        let code_vis = self.code_editor.clone();
+        let visual_self = self.visual_editor.clone();
+        let auto_comp_vis = trigger_auto_compile.clone();
+
+        self.visual_editor.set_on_delta(move |delta| {
+            let mut st = state_vis.borrow_mut();
+            if let Ok(_) = st.document.apply_delta(delta) {
+                let updated = st.document.source().to_string();
+                code_vis.set_text_silently(&updated);
+                visual_self.render_ast(st.document.ast(), &updated);
+                auto_comp_vis();
+            }
+        });
+
+        // 7. Save Document
+        let state_save = self.state.clone();
+        let toast_save = self.toast_overlay.clone();
+        btn_save.connect_clicked(move |_| {
+            let mut st = state_save.borrow_mut();
+            let target = st.current_file.clone();
+            let content = st.document.source().as_bytes();
+            if let Ok(_) = ProjectManager::atomic_write(&target, content) {
+                st.document.mark_saved();
+                toast_save.add_toast(Toast::new("Documento salvo com sucesso."));
+            } else {
+                toast_save.add_toast(Toast::new("Erro ao salvar documento."));
+            }
+        });
+
+        // 8. Undo
+        let state_undo = self.state.clone();
+        let code_undo = self.code_editor.clone();
+        let visual_undo = self.visual_editor.clone();
+        let auto_comp_undo = trigger_auto_compile.clone();
+        btn_undo.connect_clicked(move |_| {
+            let mut st = state_undo.borrow_mut();
+            if let Ok(Some(_)) = st.document.undo() {
+                let text = st.document.source().to_string();
+                code_undo.set_text_silently(&text);
+                visual_undo.render_ast(st.document.ast(), &text);
+                auto_comp_undo();
+            }
+        });
+
+        // 9. Redo
+        let state_redo = self.state.clone();
+        let code_redo = self.code_editor.clone();
+        let visual_redo = self.visual_editor.clone();
+        let auto_comp_redo = trigger_auto_compile.clone();
+        btn_redo.connect_clicked(move |_| {
+            let mut st = state_redo.borrow_mut();
+            if let Ok(Some(_)) = st.document.redo() {
+                let text = st.document.source().to_string();
+                code_redo.set_text_silently(&text);
+                visual_redo.render_ast(st.document.ast(), &text);
+                auto_comp_redo();
+            }
+        });
+
+        // 10. Clear Logs
         let log_clear = self.log_content.clone();
         let status_clear = self.status_label.clone();
         btn_clear_logs.connect_clicked(move |_| {
@@ -628,7 +820,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             status_clear.set_text("Logs limpos.");
         });
 
-        // 8. Export to ZIP
+        // 11. Export to ZIP
         let state_zip = self.state.clone();
         let toast_zip = self.toast_overlay.clone();
         btn_export.connect_clicked(move |_| {
@@ -641,14 +833,14 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             }
         });
 
-        // 9. New Project from Template Dialog
+        // 12. New Project from Template Dialog
         let toast_tmpl = self.toast_overlay.clone();
         let state_tmpl = self.state.clone();
         let code_tmpl = self.code_editor.clone();
         let visual_tmpl = self.visual_editor.clone();
+        let tc_tmpl = trigger_compile.clone();
 
         btn_new_proj.connect_clicked(move |_| {
-            // Apply template directly or show popover with templates
             if let Some(template) = TemplateCatalog::get("abnt") {
                 let st = state_tmpl.borrow();
                 let _ = template.instantiate(&st.project_dir);
@@ -657,6 +849,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                     code_tmpl.set_text_silently(&content);
                     visual_tmpl.render_ast(st.document.ast(), &content);
                     toast_tmpl.add_toast(Toast::new("Modelo ABNT aplicado com sucesso!"));
+                    tc_tmpl();
                 }
             }
         });
