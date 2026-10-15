@@ -13,7 +13,6 @@ use vibetex_document_model::{DocumentOperations, SharedDocument};
 use vibetex_latex_parser::*;
 use vibetex_pdf_viewer::PdfViewerWidget;
 use vibetex_templates::{TemplateCatalog, ZipService};
-use vibetex_visual_editor::VisualEditorWidget;
 use vibetex_workspace::{FileKind, FileTreeScanner, ProjectManager};
 
 pub struct AppState {
@@ -28,7 +27,6 @@ pub struct AppWindow {
     window: ApplicationWindow,
     toast_overlay: ToastOverlay,
     code_editor: Rc<CodeEditorWidget>,
-    visual_editor: Rc<VisualEditorWidget>,
     pdf_viewer: Rc<PdfViewerWidget>,
     state: Rc<RefCell<AppState>>,
     files_list: ListBox,
@@ -111,36 +109,35 @@ impl AppWindow {
         btn_redo.set_tooltip_text(Some("Refazer (Ctrl+Y)"));
         header.pack_start(&btn_redo);
 
-        // 2. Center: Linked Mode Switcher [Código] [Visual] [Dividido]
-        // This avoids any reparenting conflicts in GTK4!
+        // 2. Center: Linked Mode Switcher [Código] [Ambos] [Visual]
         let mode_box = Box::new(Orientation::Horizontal, 0);
         mode_box.add_css_class("linked");
 
         let btn_mode_code = ToggleButton::builder()
             .label("Código")
             .icon_name("text-x-generic-symbolic")
-            .tooltip_text("Modo Código LaTeX (Tela Inteira)")
+            .tooltip_text("Somente Código LaTeX (Tela Cheia)")
+            .build();
+
+        let btn_mode_split = ToggleButton::builder()
+            .label("Ambos")
+            .icon_name("view-dual-symbolic")
+            .tooltip_text("Código + PDF Lado a Lado (Estilo Overleaf)")
             .build();
 
         let btn_mode_visual = ToggleButton::builder()
             .label("Visual")
-            .icon_name("format-text-bold-symbolic")
-            .tooltip_text("Modo Visual Rico (Tela Inteira)")
+            .icon_name("view-preview-symbolic")
+            .tooltip_text("Somente PDF Compilado (Tela Cheia)")
             .build();
 
-        let btn_mode_split = ToggleButton::builder()
-            .label("Dividido")
-            .icon_name("view-dual-symbolic")
-            .tooltip_text("Modo Dividido (Código + Visual Lado a Lado)")
-            .build();
-
-        btn_mode_visual.set_group(Some(&btn_mode_code));
         btn_mode_split.set_group(Some(&btn_mode_code));
-        btn_mode_code.set_active(true);
+        btn_mode_visual.set_group(Some(&btn_mode_code));
+        btn_mode_split.set_active(true);
 
         mode_box.append(&btn_mode_code);
-        mode_box.append(&btn_mode_visual);
         mode_box.append(&btn_mode_split);
+        mode_box.append(&btn_mode_visual);
 
         header.set_title_widget(Some(&mode_box));
 
@@ -214,26 +211,14 @@ impl AppWindow {
         root_paned.set_start_child(Some(&sidebar_box));
 
         // 5. Center & Right Workspace:
-        // editor_pdf_paned: [Editor Area (Editors + Logs)] <---> [PDF Viewer]
+        // 5. Workspace Paned: [Left Area: Code + Logs] <---> [Right Area: PDF Viewer]
         let editor_pdf_paned = Paned::new(Orientation::Horizontal);
         editor_pdf_paned.set_vexpand(true);
         editor_pdf_paned.set_hexpand(true);
         editor_pdf_paned.set_position(570);
 
-        // Editor Split Paned (holds Code Editor and Visual Editor permanently!)
         let code_editor = Rc::new(CodeEditorWidget::new());
         code_editor.set_text_silently(&initial_text);
-
-        let visual_editor = Rc::new(VisualEditorWidget::new());
-        visual_editor.render_ast(state.borrow().document.ast(), &initial_text);
-        visual_editor.widget().set_visible(false);
-
-        let split_paned = Paned::new(Orientation::Horizontal);
-        split_paned.set_vexpand(true);
-        split_paned.set_hexpand(true);
-        split_paned.set_start_child(Some(code_editor.widget()));
-        split_paned.set_end_child(Some(visual_editor.widget()));
-        split_paned.set_position(480);
 
         // 6. Bottom Resizable & Minimizable Logs Drawer
         let bottom_drawer = Box::new(Orientation::Vertical, 0);
@@ -283,11 +268,11 @@ impl AppWindow {
         log_scroll.set_child(Some(&log_content));
         bottom_drawer.append(&log_scroll);
 
-        // Vertical Paned allowing the user to drag and adjust logs height!
+        // Vertical Paned allowing the user to drag and adjust logs height
         let editor_logs_paned = Paned::new(Orientation::Vertical);
         editor_logs_paned.set_vexpand(true);
         editor_logs_paned.set_hexpand(true);
-        editor_logs_paned.set_start_child(Some(&split_paned));
+        editor_logs_paned.set_start_child(Some(code_editor.widget()));
         editor_logs_paned.set_end_child(Some(&bottom_drawer));
         editor_logs_paned.set_position(580);
 
@@ -303,7 +288,6 @@ impl AppWindow {
             window,
             toast_overlay,
             code_editor,
-            visual_editor,
             pdf_viewer,
             state,
             files_list,
@@ -333,8 +317,8 @@ impl AppWindow {
             btn_minimize_drawer,
             sidebar_box,
             root_paned,
-            split_paned,
             editor_logs_paned,
+            editor_pdf_paned,
             log_scroll,
             btn_mode_code,
             btn_mode_visual,
@@ -408,7 +392,6 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
 
             let path_clone = item.path.clone();
             let code_editor_clone = self.code_editor.clone();
-            let visual_editor_clone = self.visual_editor.clone();
             let state_clone = self.state.clone();
 
             row.connect_activated(move |_| {
@@ -420,8 +403,6 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                             s.document = SharedDocument::new(&content);
                         }
                         code_editor_clone.set_text_silently(&content);
-                        let s = state_clone.borrow();
-                        visual_editor_clone.render_ast(s.document.ast(), &content);
                     }
                 }
             });
@@ -487,16 +468,14 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             let key_clone = entry.cite_key.clone();
             let code_clone = self.code_editor.clone();
             let state_clone = self.state.clone();
-            let visual_clone = self.visual_editor.clone();
 
             row.connect_activated(move |_| {
                 let cursor = code_clone.get_cursor_offset();
-                let delta = DocumentOperations::insert_citation(cursor, &key_clone, ChangeOrigin::VisualEditor);
+                let delta = DocumentOperations::insert_citation(cursor, &key_clone, ChangeOrigin::CodeEditor);
                 let mut s = state_clone.borrow_mut();
                 if let Ok(_) = s.document.apply_delta(delta) {
                     let updated = s.document.source().to_string();
                     code_clone.set_text_silently(&updated);
-                    visual_clone.render_ast(s.document.ast(), &updated);
                 }
             });
 
@@ -517,49 +496,49 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         btn_minimize_drawer: Button,
         sidebar_box: Box,
         root_paned: Paned,
-        split_paned: Paned,
         editor_logs_paned: Paned,
+        editor_pdf_paned: Paned,
         log_scroll: ScrolledWindow,
         btn_mode_code: ToggleButton,
         btn_mode_visual: ToggleButton,
         btn_mode_split: ToggleButton,
     ) {
-        // --- 1. View Mode Switching (No reparenting! Perfect fullscreen & split) ---
-        let code_widget = self.code_editor.widget().clone();
-        let visual_widget = self.visual_editor.widget().clone();
-        let split_ref = split_paned.clone();
+        // --- 1. View Mode Switching: [Código] [Ambos] [Visual] ---
+        let left_panel = editor_logs_paned.clone();
+        let right_panel = self.pdf_viewer.widget().clone();
+        let ws_paned = editor_pdf_paned.clone();
 
         btn_mode_code.connect_toggled({
-            let code_w = code_widget.clone();
-            let visual_w = visual_widget.clone();
+            let left_p = left_panel.clone();
+            let right_p = right_panel.clone();
             move |btn| {
                 if btn.is_active() {
-                    code_w.set_visible(true);
-                    visual_w.set_visible(false);
+                    left_p.set_visible(true);
+                    right_p.set_visible(false);
                 }
             }
         });
 
         btn_mode_visual.connect_toggled({
-            let code_w = code_widget.clone();
-            let visual_w = visual_widget.clone();
+            let left_p = left_panel.clone();
+            let right_p = right_panel.clone();
             move |btn| {
                 if btn.is_active() {
-                    code_w.set_visible(false);
-                    visual_w.set_visible(true);
+                    left_p.set_visible(false);
+                    right_p.set_visible(true);
                 }
             }
         });
 
         btn_mode_split.connect_toggled({
-            let code_w = code_widget.clone();
-            let visual_w = visual_widget.clone();
-            let split_p = split_ref.clone();
+            let left_p = left_panel.clone();
+            let right_p = right_panel.clone();
+            let ws_p = ws_paned.clone();
             move |btn| {
                 if btn.is_active() {
-                    code_w.set_visible(true);
-                    visual_w.set_visible(true);
-                    split_p.set_position(500);
+                    left_p.set_visible(true);
+                    right_p.set_visible(true);
+                    ws_p.set_position(570);
                 }
             }
         });
@@ -701,25 +680,27 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             });
         });
 
-        // Debounce timer for auto-compilation
-        let compile_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        // Debounce timer with generation counter: zero risk of GLib SourceId panics
+        let compile_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let btn_auto_ref = self.btn_auto_compile.clone();
         let trigger_auto_compile = {
             let tc = trigger_compile.clone();
-            let timer_slot = compile_timer.clone();
+            let gen_counter = compile_generation.clone();
             let auto_btn = btn_auto_ref.clone();
             Rc::new(move || {
                 if !auto_btn.is_active() {
                     return;
                 }
-                if let Some(src) = timer_slot.borrow_mut().take() {
-                    src.remove();
-                }
+                let current_gen = gen_counter.get().wrapping_add(1);
+                gen_counter.set(current_gen);
+
                 let tc_run = tc.clone();
-                let src_id = glib::timeout_add_local_once(Duration::from_millis(800), move || {
-                    tc_run();
+                let gen_check = gen_counter.clone();
+                glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                    if gen_check.get() == current_gen {
+                        tc_run();
+                    }
                 });
-                *timer_slot.borrow_mut() = Some(src_id);
             })
         };
 
@@ -729,9 +710,8 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             tc_manual();
         });
 
-        // 5. Code Editor -> Document, Visual Editor & Auto-Compile
+        // 5. Code Editor -> Document & Auto-Compile
         let state_code = self.state.clone();
-        let visual_code = self.visual_editor.clone();
         let code_ref = self.code_editor.clone();
         let auto_comp_code = trigger_auto_compile.clone();
 
@@ -747,24 +727,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             let delta = TextDelta::new(full_span, text.clone(), ChangeOrigin::CodeEditor);
             let _ = st.document.apply_delta(delta);
 
-            visual_code.render_ast(st.document.ast(), &text);
             auto_comp_code();
-        });
-
-        // 6. Visual Editor -> Document, Code Editor & Auto-Compile
-        let state_vis = self.state.clone();
-        let code_vis = self.code_editor.clone();
-        let visual_self = self.visual_editor.clone();
-        let auto_comp_vis = trigger_auto_compile.clone();
-
-        self.visual_editor.set_on_delta(move |delta| {
-            let mut st = state_vis.borrow_mut();
-            if let Ok(_) = st.document.apply_delta(delta) {
-                let updated = st.document.source().to_string();
-                code_vis.set_text_silently(&updated);
-                visual_self.render_ast(st.document.ast(), &updated);
-                auto_comp_vis();
-            }
         });
 
         // 7. Save Document
@@ -785,14 +748,12 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         // 8. Undo
         let state_undo = self.state.clone();
         let code_undo = self.code_editor.clone();
-        let visual_undo = self.visual_editor.clone();
         let auto_comp_undo = trigger_auto_compile.clone();
         btn_undo.connect_clicked(move |_| {
             let mut st = state_undo.borrow_mut();
             if let Ok(Some(_)) = st.document.undo() {
                 let text = st.document.source().to_string();
                 code_undo.set_text_silently(&text);
-                visual_undo.render_ast(st.document.ast(), &text);
                 auto_comp_undo();
             }
         });
@@ -800,14 +761,12 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         // 9. Redo
         let state_redo = self.state.clone();
         let code_redo = self.code_editor.clone();
-        let visual_redo = self.visual_editor.clone();
         let auto_comp_redo = trigger_auto_compile.clone();
         btn_redo.connect_clicked(move |_| {
             let mut st = state_redo.borrow_mut();
             if let Ok(Some(_)) = st.document.redo() {
                 let text = st.document.source().to_string();
                 code_redo.set_text_silently(&text);
-                visual_redo.render_ast(st.document.ast(), &text);
                 auto_comp_redo();
             }
         });
@@ -820,24 +779,43 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             status_clear.set_text("Logs limpos.");
         });
 
-        // 11. Export to ZIP
+        // 11. Export to ZIP (Background thread: non-blocking and safe)
         let state_zip = self.state.clone();
         let toast_zip = self.toast_overlay.clone();
         btn_export.connect_clicked(move |_| {
             let st = state_zip.borrow();
-            let zip_path = st.project_dir.join("projeto_vibetex.zip");
-            if let Ok(_) = ZipService::export_project(&st.project_dir, &zip_path) {
-                toast_zip.add_toast(Toast::new(&format!("Projeto exportado: {}", zip_path.display())));
-            } else {
-                toast_zip.add_toast(Toast::new("Erro ao exportar projeto para ZIP."));
-            }
+            let proj_dir = st.project_dir.clone();
+            let zip_path = proj_dir.join("projeto_vibetex.zip");
+            let toast_clone = toast_zip.clone();
+
+            toast_clone.add_toast(Toast::new("Exportando projeto para ZIP em segundo plano..."));
+
+            let (sender, receiver) = async_channel::bounded(1);
+            let zip_target = zip_path.clone();
+
+            std::thread::spawn(move || {
+                let res = ZipService::export_project(&proj_dir, &zip_target);
+                let _ = sender.send_blocking(res);
+            });
+
+            glib::spawn_future_local(async move {
+                if let Ok(res) = receiver.recv().await {
+                    match res {
+                        Ok(_) => {
+                            toast_clone.add_toast(Toast::new(&format!("Projeto exportado: {}", zip_path.display())));
+                        }
+                        Err(e) => {
+                            toast_clone.add_toast(Toast::new(&format!("Erro ao exportar ZIP: {}", e)));
+                        }
+                    }
+                }
+            });
         });
 
         // 12. New Project from Template Dialog
         let toast_tmpl = self.toast_overlay.clone();
         let state_tmpl = self.state.clone();
         let code_tmpl = self.code_editor.clone();
-        let visual_tmpl = self.visual_editor.clone();
         let tc_tmpl = trigger_compile.clone();
 
         btn_new_proj.connect_clicked(move |_| {
@@ -847,7 +825,6 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                 let main_path = st.project_dir.join("main.tex");
                 if let Ok(content) = std::fs::read_to_string(&main_path) {
                     code_tmpl.set_text_silently(&content);
-                    visual_tmpl.render_ast(st.document.ast(), &content);
                     toast_tmpl.add_toast(Toast::new("Modelo ABNT aplicado com sucesso!"));
                     tc_tmpl();
                 }

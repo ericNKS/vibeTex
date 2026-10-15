@@ -88,11 +88,13 @@ impl CompilerRunner {
             CompilerEngine::Tectonic => {
                 cmd.arg("-o");
                 cmd.arg(&output_dir);
+                cmd.arg("-k"); // --keep-intermediates: preserve cached aux and fonts for incremental compiling
+                cmd.arg("-C"); // --only-cached: offline-first fast bundle usage
+                cmd.arg("-c");
+                cmd.arg("minimal");
                 if config.synctex {
                     cmd.arg("--synctex");
                 }
-                cmd.arg("--keep-logs");
-                cmd.arg("--print");
                 cmd.arg(&*main_file_str);
             }
             CompilerEngine::Latexmk => {
@@ -137,13 +139,21 @@ impl CompilerRunner {
         // Check if a .log file was produced in output_dir
         let log_file_name = config.main_file.with_extension("log");
         let log_path = output_dir.join(log_file_name);
-        let full_log = if log_path.exists() {
+        let raw_full_log = if log_path.exists() {
             std::fs::read_to_string(&log_path).unwrap_or(combined_log)
         } else {
             combined_log
         };
 
-        let mut summary = LogParser::parse(&full_log);
+        // Filter out Fontconfig system warnings common on Arch/CachyOS
+        let filtered_log: String = raw_full_log
+            .lines()
+            .filter(|line| !line.starts_with("Fontconfig warning:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut summary = LogParser::parse(&filtered_log);
+        summary.raw_log = filtered_log;
         summary.success = output.status.success() && summary.success;
 
         Ok(summary)
