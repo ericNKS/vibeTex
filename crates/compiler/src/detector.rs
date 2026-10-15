@@ -104,5 +104,23 @@ fn which_binary(name: &str) -> Option<PathBuf> {
             }
         }
     }
+
+    // Common fallback directories
+    let home = std::env::var("HOME").unwrap_or_default();
+    let fallbacks = [
+        format!("{}/.local/bin", home),
+        format!("{}/.cargo/bin", home),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+    ];
+
+    for dir in &fallbacks {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
     None
 }

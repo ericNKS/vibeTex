@@ -28,17 +28,17 @@ impl CompilerRunner {
     ) -> Result<CompilationSummary, CompilerError> {
         let report = TexDetector::detect_all();
 
-        // Determine executable
-        let (binary_path, is_latexmk) = match config.engine {
+        // Determine executable and effective engine
+        let (binary_path, effective_engine) = match config.engine {
             CompilerEngine::Latexmk => {
                 if let Some(ref path) = report.latexmk.path {
-                    (path.clone(), true)
+                    (path.clone(), CompilerEngine::Latexmk)
                 } else if let Some(engine) = report.recommended_engine() {
                     let fallback_path = match engine {
-                        CompilerEngine::PdfLatex => report.pdflatex.path.unwrap(),
-                        CompilerEngine::XeLatex => report.xelatex.path.unwrap(),
-                        CompilerEngine::LuaLatex => report.lualatex.path.unwrap(),
-                        CompilerEngine::Tectonic => report.tectonic.path.unwrap(),
+                        CompilerEngine::PdfLatex => report.pdflatex.path.clone().unwrap(),
+                        CompilerEngine::XeLatex => report.xelatex.path.clone().unwrap(),
+                        CompilerEngine::LuaLatex => report.lualatex.path.clone().unwrap(),
+                        CompilerEngine::Tectonic => report.tectonic.path.clone().unwrap(),
                         _ => {
                             return Ok(CompilationSummary {
                                 success: false,
@@ -48,7 +48,7 @@ impl CompilerRunner {
                             });
                         }
                     };
-                    (fallback_path, false)
+                    (fallback_path, engine)
                 } else {
                     return Ok(CompilationSummary {
                         success: false,
@@ -58,10 +58,22 @@ impl CompilerRunner {
                     });
                 }
             }
-            CompilerEngine::PdfLatex => (report.pdflatex.path.ok_or_else(|| CompilerError::NotFound("pdflatex".into()))?, false),
-            CompilerEngine::XeLatex => (report.xelatex.path.ok_or_else(|| CompilerError::NotFound("xelatex".into()))?, false),
-            CompilerEngine::LuaLatex => (report.lualatex.path.ok_or_else(|| CompilerError::NotFound("lualatex".into()))?, false),
-            CompilerEngine::Tectonic => (report.tectonic.path.ok_or_else(|| CompilerError::NotFound("tectonic".into()))?, false),
+            CompilerEngine::PdfLatex => (
+                report.pdflatex.path.ok_or_else(|| CompilerError::NotFound("pdflatex".into()))?,
+                CompilerEngine::PdfLatex,
+            ),
+            CompilerEngine::XeLatex => (
+                report.xelatex.path.ok_or_else(|| CompilerError::NotFound("xelatex".into()))?,
+                CompilerEngine::XeLatex,
+            ),
+            CompilerEngine::LuaLatex => (
+                report.lualatex.path.ok_or_else(|| CompilerError::NotFound("lualatex".into()))?,
+                CompilerEngine::LuaLatex,
+            ),
+            CompilerEngine::Tectonic => (
+                report.tectonic.path.ok_or_else(|| CompilerError::NotFound("tectonic".into()))?,
+                CompilerEngine::Tectonic,
+            ),
         };
 
         let output_dir = project_dir.join(&config.output_dir);
@@ -72,33 +84,46 @@ impl CompilerRunner {
 
         let main_file_str = config.main_file.to_string_lossy();
 
-        if is_latexmk {
-            cmd.arg("-pdf");
-            if config.synctex {
-                cmd.arg("-synctex=1");
+        match effective_engine {
+            CompilerEngine::Tectonic => {
+                cmd.arg("-o");
+                cmd.arg(&output_dir);
+                if config.synctex {
+                    cmd.arg("--synctex");
+                }
+                cmd.arg("--keep-logs");
+                cmd.arg("--print");
+                cmd.arg(&*main_file_str);
             }
-            cmd.arg("-interaction=nonstopmode");
-            cmd.arg(format!("-output-directory={}", config.output_dir.display()));
+            CompilerEngine::Latexmk => {
+                cmd.arg("-pdf");
+                if config.synctex {
+                    cmd.arg("-synctex=1");
+                }
+                cmd.arg("-interaction=nonstopmode");
+                cmd.arg(format!("-output-directory={}", config.output_dir.display()));
 
-            if config.shell_escape {
-                cmd.arg("-shell-escape");
-            } else {
-                cmd.arg("-no-shell-escape");
+                if config.shell_escape {
+                    cmd.arg("-shell-escape");
+                } else {
+                    cmd.arg("-no-shell-escape");
+                }
+                cmd.arg(&*main_file_str);
             }
-            cmd.arg(&*main_file_str);
-        } else {
-            if config.synctex {
-                cmd.arg("-synctex=1");
-            }
-            cmd.arg("-interaction=nonstopmode");
-            cmd.arg(format!("-output-directory={}", config.output_dir.display()));
+            CompilerEngine::PdfLatex | CompilerEngine::XeLatex | CompilerEngine::LuaLatex => {
+                if config.synctex {
+                    cmd.arg("-synctex=1");
+                }
+                cmd.arg("-interaction=nonstopmode");
+                cmd.arg(format!("-output-directory={}", config.output_dir.display()));
 
-            if config.shell_escape {
-                cmd.arg("-shell-escape");
-            } else {
-                cmd.arg("-no-shell-escape");
+                if config.shell_escape {
+                    cmd.arg("-shell-escape");
+                } else {
+                    cmd.arg("-no-shell-escape");
+                }
+                cmd.arg(&*main_file_str);
             }
-            cmd.arg(&*main_file_str);
         }
 
         cmd.stdout(Stdio::piped());

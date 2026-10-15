@@ -136,7 +136,7 @@ impl AppWindow {
 
         btn_mode_visual.set_group(Some(&btn_mode_code));
         btn_mode_split.set_group(Some(&btn_mode_code));
-        btn_mode_split.set_active(true);
+        btn_mode_code.set_active(true);
 
         mode_box.append(&btn_mode_code);
         mode_box.append(&btn_mode_visual);
@@ -218,7 +218,7 @@ impl AppWindow {
         let editor_pdf_paned = Paned::new(Orientation::Horizontal);
         editor_pdf_paned.set_vexpand(true);
         editor_pdf_paned.set_hexpand(true);
-        editor_pdf_paned.set_position(650);
+        editor_pdf_paned.set_position(570);
 
         // Editor Split Paned (holds Code Editor and Visual Editor permanently!)
         let code_editor = Rc::new(CodeEditorWidget::new());
@@ -226,6 +226,7 @@ impl AppWindow {
 
         let visual_editor = Rc::new(VisualEditorWidget::new());
         visual_editor.render_ast(state.borrow().document.ast(), &initial_text);
+        visual_editor.widget().set_visible(false);
 
         let split_paned = Paned::new(Orientation::Horizontal);
         split_paned.set_vexpand(true);
@@ -318,6 +319,8 @@ impl AppWindow {
         app_win.refresh_outline();
         app_win.refresh_bib_list();
 
+        let btn_compile_init = btn_compile.clone();
+
         app_win.setup_event_handlers(
             btn_save,
             btn_compile,
@@ -338,15 +341,16 @@ impl AppWindow {
             btn_mode_split,
         );
 
-        // Check for pre-existing PDF in .build/ or project root
-        let expected_pdf = project_dir.join(".build").join("main.pdf");
+        // Check for pre-existing PDF or trigger automatic initial compilation
+        let cfg = ProjectConfig::new("VibeTeX Project", "main.tex");
+        let expected_pdf = CompilerRunner::get_pdf_path(&project_dir, &cfg);
         if expected_pdf.exists() {
             app_win.pdf_viewer.load_pdf(&expected_pdf);
         } else {
-            let root_pdf = project_dir.join("main.pdf");
-            if root_pdf.exists() {
-                app_win.pdf_viewer.load_pdf(&root_pdf);
-            }
+            // Automatically compile on startup so PDF appears immediately
+            glib::idle_add_local_once(move || {
+                btn_compile_init.emit_clicked();
+            });
         }
 
         app_win
@@ -677,14 +681,10 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
 
                             if summary.success {
                                 toast_done.add_toast(Toast::new("Compilação bem-sucedida!"));
-                                let pdf_path = proj_dir_done.join(".build").join("main.pdf");
+                                let cfg = ProjectConfig::new("VibeTeX Project", "main.tex");
+                                let pdf_path = CompilerRunner::get_pdf_path(&proj_dir_done, &cfg);
                                 if pdf_path.exists() {
                                     pdf_done.load_pdf(&pdf_path);
-                                } else {
-                                    let root_pdf = proj_dir_done.join("main.pdf");
-                                    if root_pdf.exists() {
-                                        pdf_done.load_pdf(&root_pdf);
-                                    }
                                 }
                             } else {
                                 toast_done.add_toast(Toast::new("Houve erros durante a compilação."));

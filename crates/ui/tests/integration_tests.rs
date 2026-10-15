@@ -1,6 +1,6 @@
 use vibetex_bibliography::BibIndex;
-use vibetex_compiler::{LogParser, TexDetector};
-use vibetex_core::{ChangeOrigin, Span, TextDelta};
+use vibetex_compiler::{CompilerRunner, LogParser, TexDetector};
+use vibetex_core::{ChangeOrigin, ProjectConfig, Span, TextDelta};
 use vibetex_document_model::SharedDocument;
 use vibetex_latex_parser::*;
 use vibetex_templates::TemplateCatalog;
@@ -104,6 +104,9 @@ fn test_5_compiler_detection_and_log_parsing() {
     let report = TexDetector::detect_all();
     println!("LaTeXmk disponível: {}", report.latexmk.available);
     println!("pdfLaTeX disponível: {}", report.pdflatex.available);
+    println!("Tectonic disponível: {}", report.tectonic.available);
+    println!("Tectonic path: {:?}", report.tectonic.path);
+    println!("Recomendado: {:?}", report.recommended_engine());
 
     let sample_log = r"! Undefined control sequence.
 l.12 \erroDeSintaxe
@@ -212,3 +215,17 @@ fn test_10_undo_redo_fidelity() {
     doc.redo().unwrap();
     assert_eq!(doc.source(), r"\section{Modificado} Texto");
 }
+
+#[test]
+fn test_11_real_compilation_and_pdf_generation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let main_tex = temp_dir.path().join("main.tex");
+    std::fs::write(&main_tex, r"\documentclass{article}\begin{document}Hello VibeTeX Real Engine!\end{document}").unwrap();
+    let config = ProjectConfig::new("Test", "main.tex");
+    let summary = CompilerRunner::compile(temp_dir.path(), &config, std::time::Duration::from_secs(30)).unwrap();
+    assert!(summary.success, "Compilação deve ser bem-sucedida: {:?}", summary.raw_log);
+    let pdf_path = CompilerRunner::get_pdf_path(temp_dir.path(), &config);
+    assert!(pdf_path.exists(), "PDF deve ter sido gerado em {:?}", pdf_path);
+    assert!(std::fs::metadata(&pdf_path).unwrap().len() > 0, "PDF não pode estar vazio");
+}
+
