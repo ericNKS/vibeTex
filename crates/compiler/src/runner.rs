@@ -82,6 +82,18 @@ impl CompilerRunner {
         let mut cmd = Command::new(binary_path);
         cmd.current_dir(project_dir);
 
+        // Ensure ~/.local/bin is in PATH and ~/.local/lib in LD_LIBRARY_PATH for Biber support
+        if let Ok(path_var) = std::env::var("PATH") {
+            if let Ok(home) = std::env::var("HOME") {
+                let local_bin = format!("{}/.local/bin", home);
+                cmd.env("PATH", format!("{}:{}", local_bin, path_var));
+
+                let local_lib = format!("{}/.local/lib", home);
+                let ld_var = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+                cmd.env("LD_LIBRARY_PATH", format!("{}:{}", local_lib, ld_var));
+            }
+        }
+
         let main_file_str = config.main_file.to_string_lossy();
 
         match effective_engine {
@@ -89,7 +101,6 @@ impl CompilerRunner {
                 cmd.arg("-o");
                 cmd.arg(&output_dir);
                 cmd.arg("-k"); // --keep-intermediates: preserve cached aux and fonts for incremental compiling
-                cmd.arg("-C"); // --only-cached: offline-first fast bundle usage
                 cmd.arg("-c");
                 cmd.arg("minimal");
                 if config.synctex {

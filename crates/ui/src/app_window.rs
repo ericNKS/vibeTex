@@ -2,22 +2,26 @@ use adw::prelude::*;
 use adw::{ActionRow, ApplicationWindow, HeaderBar, Toast, ToastOverlay, ViewStack, ViewSwitcher};
 use gtk4::gdk::Key;
 use gtk4::{
-    Box, Button, EventControllerKey, FileChooserAction, FileChooserNative, Label, ListBox, Orientation,
-    Paned, ResponseType, ScrolledWindow, Separator, Spinner, ToggleButton,
+    Box, Button, Entry, EventControllerKey, FileChooserAction, FileChooserNative, FileFilter, GestureClick, Image, Label,
+    ListBox, ListBoxRow, Orientation, Paned, Popover, ResponseType, ScrolledWindow, Separator, Spinner, TextView,
+    ToggleButton, WrapMode,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 use vibetex_bibliography::BibIndex;
-use vibetex_code_editor::{BibSuggestion, CodeEditorWidget};
+use vibetex_code_editor::{BibSuggestion, CodeEditorWidget, LanguageMode};
 use vibetex_compiler::CompilerRunner;
 use vibetex_core::{ChangeOrigin, DiagnosticSeverity, ProjectConfig, TextDelta};
 use vibetex_document_model::{DocumentOperations, SharedDocument};
 use vibetex_latex_parser::*;
 use vibetex_pdf_viewer::PdfViewerWidget;
 use vibetex_templates::{TemplateCatalog, ZipService};
-use vibetex_workspace::{FileKind, FileTreeScanner, ProjectManager};
+use vibetex_workspace::{
+    FileItem, FileKind, FileTreeScanner, ProjectManager, ProjectSession, SessionManager,
+};
 
 pub struct AppState {
     pub project_dir: PathBuf,
@@ -38,19 +42,37 @@ pub struct AppWindow {
     bib_list: ListBox,
     status_label: Label,
     spinner: Spinner,
-    log_content: Label,
+    log_view: TextView,
     btn_auto_compile: ToggleButton,
     #[allow(dead_code)]
+    btn_toggle_logs: ToggleButton,
+    #[allow(dead_code)]
     btn_compile: Button,
+    collapsed_dirs: Rc<RefCell<HashSet<PathBuf>>>,
 }
 
 impl AppWindow {
     pub fn new(app: &adw::Application, project_dir: PathBuf) -> Self {
-        let main_file = ProjectManager::detect_main_file(&project_dir);
-        let main_file_path = project_dir.join(&main_file);
+        let mut global_session = SessionManager::load();
+        global_session.last_project_dir = Some(project_dir.clone());
+        let _ = SessionManager::save(&global_session);
 
-        let initial_text = if main_file_path.exists() {
-            std::fs::read_to_string(&main_file_path).unwrap_or_else(|_| Self::default_initial_latex())
+        let proj_session = SessionManager::load_project_session(&project_dir, &global_session);
+
+        let current_file_path = if let Some(ref saved_file) = proj_session.current_file {
+            if saved_file.exists() && saved_file.is_file() {
+                saved_file.clone()
+            } else {
+                let main_file = ProjectManager::detect_main_file(&project_dir);
+                project_dir.join(&main_file)
+            }
+        } else {
+            let main_file = ProjectManager::detect_main_file(&project_dir);
+            project_dir.join(&main_file)
+        };
+
+        let initial_text = if current_file_path.exists() {
+            std::fs::read_to_string(&current_file_path).unwrap_or_else(|_| Self::default_initial_latex())
         } else {
             Self::default_initial_latex()
         };
@@ -71,18 +93,30 @@ impl AppWindow {
 
         let state = Rc::new(RefCell::new(AppState {
             project_dir: project_dir.clone(),
-            current_file: main_file_path,
+            current_file: current_file_path,
             document,
             bib_index,
             is_compiling: false,
         }));
 
         let toast_overlay = ToastOverlay::new();
+
+        let default_w = if global_session.window_width > 400 {
+            global_session.window_width
+        } else {
+            1400
+        };
+        let default_h = if global_session.window_height > 300 {
+            global_session.window_height
+        } else {
+            880
+        };
+
         let window = ApplicationWindow::builder()
             .application(app)
             .title("VibeTeX — Editor LaTeX Nativo")
-            .default_width(1400)
-            .default_height(880)
+            .default_width(default_w)
+            .default_height(default_h)
             .content(&toast_overlay)
             .build();
 
@@ -145,7 +179,19 @@ impl AppWindow {
 
         btn_mode_split.set_group(Some(&btn_mode_code));
         btn_mode_visual.set_group(Some(&btn_mode_code));
-        btn_mode_split.set_active(true);
+
+        let saved_view_mode = global_session.view_mode.as_deref().unwrap_or("split");
+        match saved_view_mode {
+            "code" => {
+                btn_mode_code.set_active(true);
+            }
+            "visual" => {
+                btn_mode_visual.set_active(true);
+            }
+            _ => {
+                btn_mode_split.set_active(true);
+            }
+        }
 
         mode_box.append(&btn_mode_code);
         mode_box.append(&btn_mode_split);
@@ -174,9 +220,48 @@ impl AppWindow {
         header.pack_end(&btn_auto_compile);
         header.pack_end(&spinner);
 
-        let btn_export = Button::from_icon_name("emblem-package-symbolic");
-        btn_export.set_tooltip_text(Some("Exportar Projeto para ZIP"));
-        header.pack_end(&btn_export);
+        let btn_export_menu = Button::builder()
+            .label("Exportar")
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Exportar PDF ou Projeto LaTeX (.zip)")
+            .build();
+
+        let pop_export = Popover::new();
+        pop_export.set_parent(&btn_export_menu);
+
+        let pop_export_box = Box::new(Orientation::Vertical, 4);
+        pop_export_box.set_margin_start(8);
+        pop_export_box.set_margin_end(8);
+        pop_export_box.set_margin_top(8);
+        pop_export_box.set_margin_bottom(8);
+
+        let btn_export_pdf = Button::builder()
+            .label("Exportar PDF (.pdf)")
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Salvar arquivo PDF compilado (Ctrl+Shift+S)")
+            .css_classes(["flat"])
+            .build();
+
+        let btn_export_zip = Button::builder()
+            .label("Exportar Projeto (.zip)")
+            .icon_name("folder-download-symbolic")
+            .tooltip_text("Salvar cópia compactada do projeto (Ctrl+Shift+E)")
+            .css_classes(["flat"])
+            .build();
+
+        pop_export_box.append(&btn_export_pdf);
+        pop_export_box.append(&Separator::new(Orientation::Horizontal));
+        pop_export_box.append(&btn_export_zip);
+        pop_export.set_child(Some(&pop_export_box));
+
+        {
+            let pop_exp_c = pop_export.clone();
+            btn_export_menu.connect_clicked(move |_| {
+                pop_exp_c.popup();
+            });
+        }
+
+        header.pack_end(&btn_export_menu);
 
         main_box.append(&header);
 
@@ -188,6 +273,11 @@ impl AppWindow {
         root_paned.set_position(260);
         main_box.append(&root_paned);
 
+        let code_editor = Rc::new(CodeEditorWidget::new());
+        code_editor.set_text_silently(&initial_text);
+        let initial_collapsed: HashSet<PathBuf> = proj_session.collapsed_dirs.into_iter().collect();
+        let collapsed_dirs = Rc::new(RefCell::new(initial_collapsed));
+
         // Left Sidebar: Files, Outline, Bibliography
         let sidebar_box = Box::new(Orientation::Vertical, 0);
         sidebar_box.set_size_request(240, -1);
@@ -195,20 +285,82 @@ impl AppWindow {
         let sidebar_stack = ViewStack::new();
         sidebar_stack.set_vexpand(true);
 
+        // 1. Files Tab: Toolbar with Add File / Add Folder / Refresh, plus Tree List
+        let files_tab_box = Box::new(Orientation::Vertical, 0);
+
+        let files_toolbar = Box::new(Orientation::Horizontal, 4);
+        files_toolbar.set_margin_start(8);
+        files_toolbar.set_margin_end(8);
+        files_toolbar.set_margin_top(6);
+        files_toolbar.set_margin_bottom(6);
+
+        let files_tab_title = Label::new(Some("ARQUIVOS"));
+        files_tab_title.add_css_class("caption-heading");
+        files_tab_title.set_xalign(0.0);
+        files_toolbar.append(&files_tab_title);
+
+        let files_spacer = Box::new(Orientation::Horizontal, 0);
+        files_spacer.set_hexpand(true);
+        files_toolbar.append(&files_spacer);
+
+        let btn_add_file = Button::builder()
+            .icon_name("document-new-symbolic")
+            .tooltip_text("Novo Arquivo...")
+            .css_classes(["flat", "circular"])
+            .build();
+        files_toolbar.append(&btn_add_file);
+
+        let btn_add_folder = Button::builder()
+            .icon_name("folder-new-symbolic")
+            .tooltip_text("Nova Pasta...")
+            .css_classes(["flat", "circular"])
+            .build();
+        files_toolbar.append(&btn_add_folder);
+
+        let btn_collapse_all = Button::builder()
+            .icon_name("folder-symbolic")
+            .tooltip_text("Minimizar Tudo (Recolher todas as pastas)")
+            .css_classes(["flat", "circular"])
+            .build();
+        files_toolbar.append(&btn_collapse_all);
+
+        let btn_expand_all = Button::builder()
+            .icon_name("folder-open-symbolic")
+            .tooltip_text("Maximizar Tudo (Expandir todas as pastas)")
+            .css_classes(["flat", "circular"])
+            .build();
+        files_toolbar.append(&btn_expand_all);
+
+        let btn_refresh_tree = Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text("Atualizar Árvore de Arquivos")
+            .css_classes(["flat", "circular"])
+            .build();
+        files_toolbar.append(&btn_refresh_tree);
+
+        files_tab_box.append(&files_toolbar);
+        files_tab_box.append(&Separator::new(Orientation::Horizontal));
+
         let files_list = ListBox::new();
         files_list.add_css_class("navigation-sidebar");
+        files_list.set_activate_on_single_click(true);
         let files_scroll = ScrolledWindow::new();
+        files_scroll.set_vexpand(true);
         files_scroll.set_child(Some(&files_list));
-        sidebar_stack.add_titled(&files_scroll, Some("files"), "Arquivos");
+        files_tab_box.append(&files_scroll);
+
+        sidebar_stack.add_titled(&files_tab_box, Some("files"), "Arquivos");
 
         let outline_list = ListBox::new();
         outline_list.add_css_class("navigation-sidebar");
+        outline_list.set_activate_on_single_click(true);
         let outline_scroll = ScrolledWindow::new();
         outline_scroll.set_child(Some(&outline_list));
         sidebar_stack.add_titled(&outline_scroll, Some("outline"), "Estrutura");
 
         let bib_list = ListBox::new();
         bib_list.add_css_class("navigation-sidebar");
+        bib_list.set_activate_on_single_click(true);
         let bib_scroll = ScrolledWindow::new();
         bib_scroll.set_child(Some(&bib_list));
         sidebar_stack.add_titled(&bib_scroll, Some("bib"), "Bibliografia");
@@ -222,33 +374,272 @@ impl AppWindow {
         sidebar_box.append(&sidebar_stack);
         root_paned.set_start_child(Some(&sidebar_box));
 
+        // Popovers for Toolbar Buttons:
+        // Popover for creating new file at project root
+        let pop_new_file = Popover::new();
+        pop_new_file.set_parent(&btn_add_file);
+        let pop_f_box = Box::new(Orientation::Vertical, 6);
+        pop_f_box.set_margin_start(10);
+        pop_f_box.set_margin_end(10);
+        pop_f_box.set_margin_top(8);
+        pop_f_box.set_margin_bottom(8);
+
+        let pop_f_title = Label::new(Some("Novo Arquivo"));
+        pop_f_title.add_css_class("heading");
+        pop_f_title.set_xalign(0.0);
+        pop_f_box.append(&pop_f_title);
+
+        let entry_new_file = Entry::new();
+        entry_new_file.set_placeholder_text(Some("ex: capitulo1.tex"));
+        pop_f_box.append(&entry_new_file);
+
+        let btn_do_create_file = Button::with_label("Criar");
+        btn_do_create_file.add_css_class("suggested-action");
+        pop_f_box.append(&btn_do_create_file);
+        pop_new_file.set_child(Some(&pop_f_box));
+
+        {
+            let pop = pop_new_file.clone();
+            btn_add_file.connect_clicked(move |_| {
+                pop.popup();
+            });
+        }
+
+        let do_create_root_file = {
+            let pop = pop_new_file.clone();
+            let ent = entry_new_file.clone();
+            let st = state.clone();
+            let fl = files_list.clone();
+            let ce = code_editor.clone();
+            let ol = outline_list.clone();
+            let to = toast_overlay.clone();
+            let cd = collapsed_dirs.clone();
+            Rc::new(move || {
+                let text = ent.text().trim().to_string();
+                if !text.is_empty() {
+                    let filename = if text.contains('.') {
+                        text.clone()
+                    } else {
+                        format!("{}.tex", text)
+                    };
+                    let root = st.borrow().project_dir.clone();
+                    let target = root.join(&filename);
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if !target.exists() {
+                        let init_stub = if filename.ends_with(".tex") {
+                            format!("% {}\n", filename)
+                        } else {
+                            String::new()
+                        };
+                        let _ = std::fs::write(&target, init_stub);
+                        to.add_toast(Toast::new(&format!("Arquivo criado: {}", filename)));
+                        Self::open_file_in_editor(&target, &st, &ce, &ol, Some(&to));
+                        Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, Some(&to), &cd);
+                    } else {
+                        to.add_toast(Toast::new(&format!("Arquivo já existe: {}", filename)));
+                    }
+                    pop.popdown();
+                    ent.set_text("");
+                }
+            })
+        };
+
+        {
+            let action = do_create_root_file.clone();
+            entry_new_file.connect_activate(move |_| {
+                action();
+            });
+        }
+        {
+            let action = do_create_root_file.clone();
+            btn_do_create_file.connect_clicked(move |_| {
+                action();
+            });
+        }
+
+        // Popover for creating new folder at project root
+        let pop_new_folder = Popover::new();
+        pop_new_folder.set_parent(&btn_add_folder);
+        let pop_d_box = Box::new(Orientation::Vertical, 6);
+        pop_d_box.set_margin_start(10);
+        pop_d_box.set_margin_end(10);
+        pop_d_box.set_margin_top(8);
+        pop_d_box.set_margin_bottom(8);
+
+        let pop_d_title = Label::new(Some("Nova Pasta"));
+        pop_d_title.add_css_class("heading");
+        pop_d_title.set_xalign(0.0);
+        pop_d_box.append(&pop_d_title);
+
+        let entry_new_folder = Entry::new();
+        entry_new_folder.set_placeholder_text(Some("ex: capitulos ou imagens"));
+        pop_d_box.append(&entry_new_folder);
+
+        let btn_do_create_folder = Button::with_label("Criar");
+        btn_do_create_folder.add_css_class("suggested-action");
+        pop_d_box.append(&btn_do_create_folder);
+        pop_new_folder.set_child(Some(&pop_d_box));
+
+        {
+            let pop = pop_new_folder.clone();
+            btn_add_folder.connect_clicked(move |_| {
+                pop.popup();
+            });
+        }
+
+        let do_create_root_folder = {
+            let pop = pop_new_folder.clone();
+            let ent = entry_new_folder.clone();
+            let st = state.clone();
+            let fl = files_list.clone();
+            let ce = code_editor.clone();
+            let ol = outline_list.clone();
+            let to = toast_overlay.clone();
+            let cd = collapsed_dirs.clone();
+            Rc::new(move || {
+                let text = ent.text().trim().to_string();
+                if !text.is_empty() {
+                    let root = st.borrow().project_dir.clone();
+                    let target = root.join(&text);
+                    let _ = std::fs::create_dir_all(&target);
+                    to.add_toast(Toast::new(&format!("Pasta criada: {}", text)));
+                    Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, Some(&to), &cd);
+                    pop.popdown();
+                    ent.set_text("");
+                }
+            })
+        };
+
+        {
+            let action = do_create_root_folder.clone();
+            entry_new_folder.connect_activate(move |_| {
+                action();
+            });
+        }
+        {
+            let action = do_create_root_folder.clone();
+            btn_do_create_folder.connect_clicked(move |_| {
+                action();
+            });
+        }
+
+        // Refresh tree button
+        {
+            let fl = files_list.clone();
+            let st = state.clone();
+            let ce = code_editor.clone();
+            let ol = outline_list.clone();
+            let to = toast_overlay.clone();
+            let cd = collapsed_dirs.clone();
+            btn_refresh_tree.connect_clicked(move |_| {
+                Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, Some(&to), &cd);
+                to.add_toast(Toast::new("Árvore de arquivos atualizada"));
+            });
+        }
+
+        // Collapse all folders button
+        {
+            let st = state.clone();
+            let cd = collapsed_dirs.clone();
+            let fl = files_list.clone();
+            let ce = code_editor.clone();
+            let ol = outline_list.clone();
+            let to = toast_overlay.clone();
+            btn_collapse_all.connect_clicked(move |_| {
+                let (project_dir, curr_file) = {
+                    let s = st.borrow();
+                    (s.project_dir.clone(), s.current_file.clone())
+                };
+
+                let items = FileTreeScanner::scan_project(&project_dir);
+                let mut dirs = HashSet::new();
+                fn collect_dirs(items: &[FileItem], dirs: &mut HashSet<PathBuf>) {
+                    for it in items {
+                        if it.kind == FileKind::Directory {
+                            dirs.insert(it.path.clone());
+                            collect_dirs(&it.children, dirs);
+                        }
+                    }
+                }
+                collect_dirs(&items, &mut dirs);
+                *cd.borrow_mut() = dirs.clone();
+
+                let proj_session = ProjectSession {
+                    current_file: Some(curr_file),
+                    collapsed_dirs: dirs.into_iter().collect(),
+                };
+                let _ = SessionManager::save_project_session(&project_dir, &proj_session);
+
+                let mut global = SessionManager::load();
+                global.projects.insert(project_dir, proj_session);
+                let _ = SessionManager::save(&global);
+
+                Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, Some(&to), &cd);
+                to.add_toast(Toast::new("Todas as pastas foram recolhidas."));
+            });
+        }
+
+        // Expand all folders button
+        {
+            let st = state.clone();
+            let cd = collapsed_dirs.clone();
+            let fl = files_list.clone();
+            let ce = code_editor.clone();
+            let ol = outline_list.clone();
+            let to = toast_overlay.clone();
+            btn_expand_all.connect_clicked(move |_| {
+                let (project_dir, curr_file) = {
+                    let s = st.borrow();
+                    (s.project_dir.clone(), s.current_file.clone())
+                };
+
+                cd.borrow_mut().clear();
+
+                let proj_session = ProjectSession {
+                    current_file: Some(curr_file),
+                    collapsed_dirs: Vec::new(),
+                };
+                let _ = SessionManager::save_project_session(&project_dir, &proj_session);
+
+                let mut global = SessionManager::load();
+                global.projects.insert(project_dir, proj_session);
+                let _ = SessionManager::save(&global);
+
+                Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, Some(&to), &cd);
+                to.add_toast(Toast::new("Todas as pastas foram expandidas."));
+            });
+        }
+
         // 5. Center & Right Workspace:
-        // 5. Workspace Paned: [Left Area: Code + Logs] <---> [Right Area: PDF Viewer]
+        // Workspace Paned: [Left Area: Code + Status + Collapsible Logs] <---> [Right Area: PDF Viewer]
         let editor_pdf_paned = Paned::new(Orientation::Horizontal);
         editor_pdf_paned.set_vexpand(true);
         editor_pdf_paned.set_hexpand(true);
         editor_pdf_paned.set_position(570);
 
-        let code_editor = Rc::new(CodeEditorWidget::new());
-        code_editor.set_text_silently(&initial_text);
-
-        // 6. Bottom Resizable & Minimizable Logs Drawer
+        // 6. Bottom Resizable & Minimizable Logs Drawer (Hidden by default!)
         let bottom_drawer = Box::new(Orientation::Vertical, 0);
         bottom_drawer.add_css_class("card");
         bottom_drawer.set_margin_start(8);
         bottom_drawer.set_margin_end(8);
-        bottom_drawer.set_margin_bottom(6);
+        bottom_drawer.set_margin_bottom(4);
+        bottom_drawer.set_visible(false); // Hidden by default
 
         let drawer_header = Box::new(Orientation::Horizontal, 8);
         drawer_header.set_margin_start(12);
-        drawer_header.set_margin_end(12);
+        drawer_header.set_margin_end(8);
         drawer_header.set_margin_top(6);
         drawer_header.set_margin_bottom(6);
 
-        let status_label = Label::new(Some("Pronto. (0 erros, 0 avisos)"));
-        status_label.set_xalign(0.0);
-        status_label.add_css_class("dim-label");
-        drawer_header.append(&status_label);
+        let drawer_icon = Image::from_icon_name("utilities-terminal-symbolic");
+        drawer_header.append(&drawer_icon);
+
+        let drawer_title = Label::new(Some("Logs & Diagnóstico de Compilação"));
+        drawer_title.add_css_class("heading");
+        drawer_title.set_xalign(0.0);
+        drawer_header.append(&drawer_title);
 
         let drawer_spacer = Box::new(Orientation::Horizontal, 0);
         drawer_spacer.set_hexpand(true);
@@ -256,31 +647,37 @@ impl AppWindow {
 
         let btn_clear_logs = Button::from_icon_name("edit-clear-symbolic");
         btn_clear_logs.set_tooltip_text(Some("Limpar Logs"));
+        btn_clear_logs.add_css_class("flat");
         drawer_header.append(&btn_clear_logs);
 
-        let btn_minimize_drawer = Button::builder()
-            .icon_name("pan-down-symbolic")
-            .tooltip_text("Minimizar / Expandir Painel de Logs")
+        let btn_close_drawer = Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Fechar Painel de Logs (Ctrl+J)")
+            .css_classes(["flat"])
             .build();
-        drawer_header.append(&btn_minimize_drawer);
+        drawer_header.append(&btn_close_drawer);
 
         bottom_drawer.append(&drawer_header);
         bottom_drawer.append(&Separator::new(Orientation::Horizontal));
 
         let log_scroll = ScrolledWindow::new();
         log_scroll.set_vexpand(true);
-        let log_content = Label::new(Some("VibeTeX inicializado. Pronto para compilar."));
-        log_content.add_css_class("monospace");
-        log_content.set_xalign(0.0);
-        log_content.set_yalign(0.0);
-        log_content.set_wrap(true);
-        log_content.set_margin_start(12);
-        log_content.set_margin_end(12);
-        log_content.set_margin_top(6);
-        log_scroll.set_child(Some(&log_content));
+
+        // Native TextView: Monospace, selectable with mouse/keyboard, copyable (Ctrl+C)
+        let log_view = TextView::new();
+        log_view.set_editable(false);
+        log_view.set_cursor_visible(true);
+        log_view.set_monospace(true);
+        log_view.set_wrap_mode(WrapMode::WordChar);
+        log_view.set_left_margin(12);
+        log_view.set_right_margin(12);
+        log_view.set_top_margin(8);
+        log_view.set_bottom_margin(8);
+        log_view.buffer().set_text("VibeTeX inicializado. Pronto para compilar.");
+        log_scroll.set_child(Some(&log_view));
         bottom_drawer.append(&log_scroll);
 
-        // Vertical Paned allowing the user to drag and adjust logs height
+        // Vertical Paned allowing the user to drag and adjust logs height when open
         let editor_logs_paned = Paned::new(Orientation::Vertical);
         editor_logs_paned.set_vexpand(true);
         editor_logs_paned.set_hexpand(true);
@@ -288,10 +685,169 @@ impl AppWindow {
         editor_logs_paned.set_end_child(Some(&bottom_drawer));
         editor_logs_paned.set_position(580);
 
-        editor_pdf_paned.set_start_child(Some(&editor_logs_paned));
+        // 7. Bottom Status & Dock Strip (Zed-style)
+        let status_strip = Box::new(Orientation::Horizontal, 8);
+        status_strip.add_css_class("toolbar");
+        status_strip.set_margin_start(10);
+        status_strip.set_margin_end(8);
+        status_strip.set_margin_top(2);
+        status_strip.set_margin_bottom(2);
 
-        // 7. PDF Viewer on the right
+        let status_label = Label::new(Some("Pronto. (0 erros, 0 avisos)"));
+        status_label.set_xalign(0.0);
+        status_label.add_css_class("dim-label");
+        status_strip.append(&status_label);
+
+        let status_spacer = Box::new(Orientation::Horizontal, 0);
+        status_spacer.set_hexpand(true);
+        status_strip.append(&status_spacer);
+
+        // Spell Checker Status Button (e.g. "✓ PT-BR" or "⚠️ 2 erros (PT-BR)")
+        let btn_spell_status = Button::builder()
+            .label("✓ PT-BR")
+            .tooltip_text("Corretor Ortográfico (Clique para saltar para o próximo erro, atalho: F7)")
+            .css_classes(["flat", "caption"])
+            .build();
+        status_strip.append(&btn_spell_status);
+
+        // Spell Checker Language Selector Popover Button
+        let btn_spell_lang = Button::builder()
+            .icon_name("tools-check-spelling-symbolic")
+            .tooltip_text("Configurar Idioma do Corretor (Português / Inglês / Bilíngue)")
+            .css_classes(["flat"])
+            .build();
+        status_strip.append(&btn_spell_lang);
+
+        let pop_spell_lang = Popover::builder()
+            .autohide(true)
+            .has_arrow(true)
+            .build();
+        pop_spell_lang.set_parent(&btn_spell_lang);
+
+        let lang_menu_box = Box::new(Orientation::Vertical, 4);
+        lang_menu_box.set_margin_start(8);
+        lang_menu_box.set_margin_end(8);
+        lang_menu_box.set_margin_top(8);
+        lang_menu_box.set_margin_bottom(8);
+
+        let lang_title = Label::new(None);
+        lang_title.set_markup("<b>Idioma do Corretor</b>");
+        lang_title.set_xalign(0.0);
+        lang_menu_box.append(&lang_title);
+        lang_menu_box.append(&Separator::new(Orientation::Horizontal));
+
+        let opt_pt = Button::builder().label("🇧🇷 Português (Brasil)").css_classes(["flat"]).build();
+        let opt_en = Button::builder().label("🇺🇸 Inglês (US)").css_classes(["flat"]).build();
+        let opt_bi = Button::builder().label("🌐 Bilíngue (PT + EN)").css_classes(["flat"]).build();
+        let opt_off = Button::builder().label("❌ Desativado").css_classes(["flat"]).build();
+
+        {
+            let code_c = code_editor.clone();
+            let pop_c = pop_spell_lang.clone();
+            opt_pt.connect_clicked(move |_| {
+                code_c.set_language_mode(LanguageMode::Portuguese);
+                pop_c.popdown();
+            });
+        }
+        {
+            let code_c = code_editor.clone();
+            let pop_c = pop_spell_lang.clone();
+            opt_en.connect_clicked(move |_| {
+                code_c.set_language_mode(LanguageMode::English);
+                pop_c.popdown();
+            });
+        }
+        {
+            let code_c = code_editor.clone();
+            let pop_c = pop_spell_lang.clone();
+            opt_bi.connect_clicked(move |_| {
+                code_c.set_language_mode(LanguageMode::Bilingual);
+                pop_c.popdown();
+            });
+        }
+        {
+            let code_c = code_editor.clone();
+            let pop_c = pop_spell_lang.clone();
+            opt_off.connect_clicked(move |_| {
+                code_c.set_language_mode(LanguageMode::Disabled);
+                pop_c.popdown();
+            });
+        }
+
+        lang_menu_box.append(&opt_pt);
+        lang_menu_box.append(&opt_en);
+        lang_menu_box.append(&opt_bi);
+        lang_menu_box.append(&Separator::new(Orientation::Horizontal));
+        lang_menu_box.append(&opt_off);
+        pop_spell_lang.set_child(Some(&lang_menu_box));
+
+        {
+            let pop_c = pop_spell_lang.clone();
+            btn_spell_lang.connect_clicked(move |_| {
+                pop_c.popup();
+            });
+        }
+
+        // Automatic spell status update on badge
+        let badge_ref = btn_spell_status.clone();
+        code_editor.connect_spell_checked(move |count, mode| {
+            if mode == LanguageMode::Disabled {
+                badge_ref.set_label("Ortografia: OFF");
+                badge_ref.remove_css_class("error");
+            } else if count == 0 {
+                badge_ref.set_label(&format!("✓ {}", mode.short_label()));
+                badge_ref.remove_css_class("error");
+            } else {
+                badge_ref.set_label(&format!("⚠️ {} erros ({})", count, mode.short_label()));
+                badge_ref.add_css_class("error");
+            }
+        });
+
+        // Click on badge jumps to next error
+        let code_jump = code_editor.clone();
+        let toast_jump = toast_overlay.clone();
+        btn_spell_status.connect_clicked(move |_| {
+            if let Some(_) = code_jump.jump_to_next_spell_error() {
+                toast_jump.add_toast(Toast::new("Saltou para o próximo erro ortográfico."));
+            } else {
+                toast_jump.add_toast(Toast::new("Nenhum erro ortográfico no documento!"));
+            }
+        });
+
+        // Set project dictionary location
+        code_editor.spell_checker().set_project_dict(&project_dir);
+
+        // Zed-style Debug / Terminal Icon Toggle Button
+        let btn_toggle_logs = ToggleButton::builder()
+            .icon_name("utilities-terminal-symbolic")
+            .tooltip_text("Alternar Painel de Logs / Debug (Ctrl+J)")
+            .css_classes(["flat"])
+            .active(false)
+            .build();
+        status_strip.append(&btn_toggle_logs);
+
+        let left_editor_box = Box::new(Orientation::Vertical, 0);
+        left_editor_box.set_vexpand(true);
+        left_editor_box.set_hexpand(true);
+        left_editor_box.append(&editor_logs_paned);
+        left_editor_box.append(&status_strip);
+
+        editor_pdf_paned.set_start_child(Some(&left_editor_box));
+
+        // 8. PDF Viewer on the right
         let pdf_viewer = Rc::new(PdfViewerWidget::new());
+        if let Some(ref p_mode) = global_session.pdf_view_mode {
+            pdf_viewer.set_view_mode_str(p_mode);
+        }
+        if let Some(zoom) = global_session.pdf_zoom {
+            pdf_viewer.set_zoom(zoom);
+        }
+        {
+            let toast_pdf = toast_overlay.clone();
+            pdf_viewer.connect_toast(move |msg| {
+                toast_pdf.add_toast(Toast::new(msg));
+            });
+        }
         editor_pdf_paned.set_end_child(Some(pdf_viewer.widget()));
 
         root_paned.set_end_child(Some(&editor_pdf_paned));
@@ -307,10 +863,58 @@ impl AppWindow {
             bib_list,
             status_label,
             spinner,
-            log_content,
+            log_view,
             btn_auto_compile,
+            btn_toggle_logs: btn_toggle_logs.clone(),
             btn_compile: btn_compile.clone(),
+            collapsed_dirs,
         };
+
+        // Save session on window close
+        {
+            let win_close = app_win.window.clone();
+            let state_close = app_win.state.clone();
+            let pdf_close = app_win.pdf_viewer.clone();
+            let collapsed_close = app_win.collapsed_dirs.clone();
+            let btn_code_close = btn_mode_code.clone();
+            let btn_visual_close = btn_mode_visual.clone();
+
+            app_win.window.connect_close_request(move |_| {
+                let (proj_dir, curr_file) = {
+                    let st = state_close.borrow();
+                    (st.project_dir.clone(), st.current_file.clone())
+                };
+
+                let view_mode = if btn_code_close.is_active() {
+                    "code".to_string()
+                } else if btn_visual_close.is_active() {
+                    "visual".to_string()
+                } else {
+                    "split".to_string()
+                };
+
+                let collapsed: Vec<PathBuf> = collapsed_close.borrow().iter().cloned().collect();
+                let proj_session = ProjectSession {
+                    current_file: Some(curr_file),
+                    collapsed_dirs: collapsed,
+                };
+
+                let _ = SessionManager::save_project_session(&proj_dir, &proj_session);
+
+                let mut global = SessionManager::load();
+                global.last_project_dir = Some(proj_dir.clone());
+                global.view_mode = Some(view_mode);
+                global.window_width = win_close.default_width();
+                global.window_height = win_close.default_height();
+                global.pdf_view_mode = Some(pdf_close.view_mode_str());
+                global.pdf_zoom = Some(pdf_close.zoom());
+                global.projects.insert(proj_dir, proj_session);
+
+                let _ = SessionManager::save(&global);
+
+                glib::Propagation::Proceed
+            });
+        }
 
         app_win.refresh_file_tree();
         app_win.refresh_outline();
@@ -325,15 +929,19 @@ impl AppWindow {
             btn_undo,
             btn_redo,
             btn_new_proj,
-            btn_export,
+            pop_export,
+            btn_export_pdf,
+            btn_export_zip,
             btn_clear_logs,
             btn_toggle_sidebar,
-            btn_minimize_drawer,
+            btn_toggle_logs,
+            btn_close_drawer,
+            btn_spell_status,
+            bottom_drawer,
             sidebar_box,
             root_paned,
             editor_logs_paned,
             editor_pdf_paned,
-            log_scroll,
             btn_mode_code,
             btn_mode_visual,
             btn_mode_split,
@@ -391,7 +999,14 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
     }
 
     pub fn refresh_file_tree(&self) {
-        Self::refresh_file_tree_impl(&self.files_list, &self.state, &self.code_editor, &self.outline_list);
+        Self::refresh_file_tree_impl(
+            &self.files_list,
+            &self.state,
+            &self.code_editor,
+            &self.outline_list,
+            Some(&self.toast_overlay),
+            &self.collapsed_dirs,
+        );
     }
 
     pub fn refresh_outline(&self) {
@@ -414,8 +1029,59 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             &self.outline_list,
             &self.bib_list,
             &self.btn_compile,
+            &self.collapsed_dirs,
             new_dir,
         );
+    }
+
+    fn open_file_in_editor(
+        path: &Path,
+        state: &Rc<RefCell<AppState>>,
+        code_editor: &Rc<CodeEditorWidget>,
+        outline_list: &ListBox,
+        toast_overlay: Option<&ToastOverlay>,
+    ) {
+        if !path.is_file() {
+            return;
+        }
+
+        // 1. Save currently open file to disk first so no changes are lost
+        {
+            let st = state.borrow();
+            let _ = ProjectManager::atomic_write(&st.current_file, st.document.source().as_bytes());
+        }
+
+        // 2. Read new file content and switch
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let project_dir = {
+                    let mut s = state.borrow_mut();
+                    s.current_file = path.to_path_buf();
+                    s.document = SharedDocument::new(&content);
+                    s.project_dir.clone()
+                };
+                code_editor.set_text_silently(&content);
+                Self::refresh_outline_impl(outline_list, state, code_editor);
+
+                // Persist current_file in project session
+                let mut global = SessionManager::load();
+                let mut proj_session = SessionManager::load_project_session(&project_dir, &global);
+                proj_session.current_file = Some(path.to_path_buf());
+                let _ = SessionManager::save_project_session(&project_dir, &proj_session);
+                global.projects.insert(project_dir, proj_session);
+                let _ = SessionManager::save(&global);
+
+                if let Some(toast) = toast_overlay {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    toast.add_toast(Toast::new(&format!("Arquivo aberto: {}", name)));
+                }
+            }
+            Err(err) => {
+                if let Some(toast) = toast_overlay {
+                    toast.add_toast(Toast::new(&format!("Não foi possível abrir como texto: {}", err)));
+                }
+            }
+        }
     }
 
     fn refresh_file_tree_impl(
@@ -423,6 +1089,8 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         state: &Rc<RefCell<AppState>>,
         code_editor: &Rc<CodeEditorWidget>,
         outline_list: &ListBox,
+        toast_overlay: Option<&ToastOverlay>,
+        collapsed_dirs: &Rc<RefCell<HashSet<PathBuf>>>,
     ) {
         while let Some(child) = files_list.first_child() {
             files_list.remove(&child);
@@ -431,32 +1099,535 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         let st = state.borrow();
         let items = FileTreeScanner::scan_project(&st.project_dir);
 
+        Self::render_tree_items(
+            &items,
+            0,
+            files_list,
+            state,
+            code_editor,
+            outline_list,
+            toast_overlay,
+            collapsed_dirs,
+        );
+    }
+
+    fn render_tree_items(
+        items: &[FileItem],
+        depth: u32,
+        files_list: &ListBox,
+        state: &Rc<RefCell<AppState>>,
+        code_editor: &Rc<CodeEditorWidget>,
+        outline_list: &ListBox,
+        toast_overlay: Option<&ToastOverlay>,
+        collapsed_dirs: &Rc<RefCell<HashSet<PathBuf>>>,
+    ) {
+        let current_file = {
+            let st = state.borrow();
+            st.current_file.clone()
+        };
+
         for item in items {
-            let row = ActionRow::new();
-            row.set_title(&item.name);
-            row.set_icon_name(Some(item.kind.icon_name()));
+            let row = ListBoxRow::new();
             row.set_activatable(true);
 
-            let path_clone = item.path.clone();
-            let code_editor_clone = code_editor.clone();
-            let state_clone = state.clone();
-            let outline_clone = outline_list.clone();
+            let hbox = Box::new(Orientation::Horizontal, 4);
+            hbox.set_margin_top(2);
+            hbox.set_margin_bottom(2);
+            hbox.set_margin_start(((depth * 14) + 6) as i32);
+            hbox.set_margin_end(6);
 
-            row.connect_activated(move |_| {
-                if item.kind == FileKind::Latex {
-                    if let Ok(content) = std::fs::read_to_string(&path_clone) {
-                        {
-                            let mut s = state_clone.borrow_mut();
-                            s.current_file = path_clone.clone();
-                            s.document = SharedDocument::new(&content);
-                        }
-                        code_editor_clone.set_text_silently(&content);
-                        Self::refresh_outline_impl(&outline_clone, &state_clone, &code_editor_clone);
-                    }
+            let click_target = Box::new(Orientation::Horizontal, 6);
+            click_target.set_hexpand(true);
+
+            if item.kind == FileKind::Directory {
+                let is_collapsed = collapsed_dirs.borrow().contains(&item.path);
+
+                // Expand / Collapse Arrow Icon
+                let arrow_icon = Image::from_icon_name(if is_collapsed {
+                    "pan-end-symbolic"
+                } else {
+                    "pan-down-symbolic"
+                });
+                arrow_icon.set_pixel_size(12);
+                click_target.append(&arrow_icon);
+
+                // Folder Icon
+                let folder_icon = Image::from_icon_name(if is_collapsed {
+                    "folder-symbolic"
+                } else {
+                    "folder-open-symbolic"
+                });
+                click_target.append(&folder_icon);
+
+                // Folder Name Label
+                let label = Label::new(Some(&item.name));
+                label.set_xalign(0.0);
+                label.add_css_class("heading");
+                label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                click_target.append(&label);
+
+                hbox.append(&click_target);
+
+                // Action 1: Add File or Subfolder in this directory
+                let btn_add = Button::builder()
+                    .icon_name("list-add-symbolic")
+                    .tooltip_text("Criar arquivo ou pasta aqui...")
+                    .css_classes(["flat", "circular"])
+                    .build();
+
+                let pop_add = Popover::new();
+                pop_add.set_parent(&btn_add);
+
+                let pop_box = Box::new(Orientation::Vertical, 6);
+                pop_box.set_margin_start(10);
+                pop_box.set_margin_end(10);
+                pop_box.set_margin_top(8);
+                pop_box.set_margin_bottom(8);
+
+                let pop_title = Label::new(Some(&format!("Criar em {}", item.name)));
+                pop_title.add_css_class("heading");
+                pop_title.set_xalign(0.0);
+                pop_box.append(&pop_title);
+
+                let entry_name = Entry::new();
+                entry_name.set_placeholder_text(Some("Nome (ex: intro.tex ou imagens)"));
+                pop_box.append(&entry_name);
+
+                let actions_box = Box::new(Orientation::Horizontal, 6);
+
+                let btn_create_file = Button::with_label("+ Arquivo");
+                btn_create_file.add_css_class("suggested-action");
+                actions_box.append(&btn_create_file);
+
+                let btn_create_folder = Button::with_label("+ Pasta");
+                actions_box.append(&btn_create_folder);
+
+                pop_box.append(&actions_box);
+                pop_add.set_child(Some(&pop_box));
+
+                let pop_clone = pop_add.clone();
+                btn_add.connect_clicked(move |_| {
+                    pop_clone.popup();
+                });
+
+                // Enter inside entry activates + Arquivo
+                {
+                    let bcf = btn_create_file.clone();
+                    entry_name.connect_activate(move |_| {
+                        bcf.emit_clicked();
+                    });
                 }
-            });
 
-            files_list.append(&row);
+                // Handler: + Arquivo
+                {
+                    let pop = pop_add.clone();
+                    let ent = entry_name.clone();
+                    let dir_path = item.path.clone();
+                    let fl = files_list.clone();
+                    let st = state.clone();
+                    let ce = code_editor.clone();
+                    let ol = outline_list.clone();
+                    let to = toast_overlay.cloned();
+                    let cd = collapsed_dirs.clone();
+                    btn_create_file.connect_clicked(move |_| {
+                        let text = ent.text().trim().to_string();
+                        if !text.is_empty() {
+                            let filename = if text.contains('.') {
+                                text.clone()
+                            } else {
+                                format!("{}.tex", text)
+                            };
+                            let target = dir_path.join(&filename);
+                            if let Some(parent) = target.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if !target.exists() {
+                                let init_stub = if filename.ends_with(".tex") {
+                                    format!("% {}\n", filename)
+                                } else {
+                                    String::new()
+                                };
+                                let _ = std::fs::write(&target, init_stub);
+                                if let Some(ref t) = to {
+                                    t.add_toast(Toast::new(&format!("Arquivo criado: {}", filename)));
+                                }
+                                cd.borrow_mut().remove(&dir_path);
+                                Self::open_file_in_editor(&target, &st, &ce, &ol, to.as_ref());
+                                Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, to.as_ref(), &cd);
+                            } else if let Some(ref t) = to {
+                                t.add_toast(Toast::new(&format!("Arquivo já existe: {}", filename)));
+                            }
+                            pop.popdown();
+                            ent.set_text("");
+                        }
+                    });
+                }
+
+                // Handler: + Pasta
+                {
+                    let pop = pop_add.clone();
+                    let ent = entry_name.clone();
+                    let dir_path = item.path.clone();
+                    let fl = files_list.clone();
+                    let st = state.clone();
+                    let ce = code_editor.clone();
+                    let ol = outline_list.clone();
+                    let to = toast_overlay.cloned();
+                    let cd = collapsed_dirs.clone();
+                    btn_create_folder.connect_clicked(move |_| {
+                        let text = ent.text().trim().to_string();
+                        if !text.is_empty() {
+                            let target = dir_path.join(&text);
+                            let _ = std::fs::create_dir_all(&target);
+                            if let Some(ref t) = to {
+                                t.add_toast(Toast::new(&format!("Pasta criada: {}", text)));
+                            }
+                            cd.borrow_mut().remove(&dir_path);
+                            Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, to.as_ref(), &cd);
+                            pop.popdown();
+                            ent.set_text("");
+                        }
+                    });
+                }
+
+                hbox.append(&btn_add);
+
+                // Action 2: Delete Folder with confirmation
+                let btn_del = Button::builder()
+                    .icon_name("user-trash-symbolic")
+                    .tooltip_text("Excluir pasta...")
+                    .css_classes(["flat", "circular"])
+                    .build();
+
+                let pop_del = Popover::new();
+                pop_del.set_parent(&btn_del);
+
+                let del_box = Box::new(Orientation::Vertical, 8);
+                del_box.set_margin_start(10);
+                del_box.set_margin_end(10);
+                del_box.set_margin_top(8);
+                del_box.set_margin_bottom(8);
+
+                let del_title = Label::new(Some(&format!("Excluir pasta '{}'?", item.name)));
+                del_title.add_css_class("heading");
+                del_title.set_xalign(0.0);
+                del_box.append(&del_title);
+
+                let del_msg = Label::new(Some("A pasta e todo o seu conteúdo serão removidos permanentemente."));
+                del_msg.add_css_class("dim-label");
+                del_msg.set_wrap(true);
+                del_msg.set_max_width_chars(25);
+                del_box.append(&del_msg);
+
+                let del_btns = Box::new(Orientation::Horizontal, 8);
+                let btn_cancel = Button::with_label("Cancelar");
+                let btn_confirm_del = Button::with_label("Excluir");
+                btn_confirm_del.add_css_class("destructive-action");
+                del_btns.append(&btn_cancel);
+                del_btns.append(&btn_confirm_del);
+                del_box.append(&del_btns);
+
+                pop_del.set_child(Some(&del_box));
+
+                let pop_del_clone = pop_del.clone();
+                btn_del.connect_clicked(move |_| {
+                    pop_del_clone.popup();
+                });
+
+                {
+                    let pop = pop_del.clone();
+                    btn_cancel.connect_clicked(move |_| {
+                        pop.popdown();
+                    });
+                }
+
+                {
+                    let pop = pop_del.clone();
+                    let target = item.path.clone();
+                    let name_str = item.name.clone();
+                    let fl = files_list.clone();
+                    let st = state.clone();
+                    let ce = code_editor.clone();
+                    let ol = outline_list.clone();
+                    let to = toast_overlay.cloned();
+                    let cd = collapsed_dirs.clone();
+                    btn_confirm_del.connect_clicked(move |_| {
+                        let is_current_inside = {
+                            let s = st.borrow();
+                            s.current_file == target || s.current_file.starts_with(&target)
+                        };
+                        let _ = std::fs::remove_dir_all(&target);
+                        if let Some(ref t) = to {
+                            t.add_toast(Toast::new(&format!("Pasta excluída: {}", name_str)));
+                        }
+                        pop.popdown();
+
+                        if is_current_inside {
+                            let root = st.borrow().project_dir.clone();
+                            let main_path = root.join("main.tex");
+                            if main_path.exists() {
+                                Self::open_file_in_editor(&main_path, &st, &ce, &ol, to.as_ref());
+                            } else if let Some(another) = FileTreeScanner::scan_flat_files(&root)
+                                .into_iter()
+                                .find(|f| f.kind == FileKind::Latex)
+                            {
+                                Self::open_file_in_editor(&another.path, &st, &ce, &ol, to.as_ref());
+                            } else {
+                                ce.set_text_silently("");
+                            }
+                        }
+                        cd.borrow_mut().remove(&target);
+                        Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, to.as_ref(), &cd);
+                    });
+                }
+
+                hbox.append(&btn_del);
+
+                // Clicking directory toggles collapse
+                let folder_path = item.path.clone();
+                let fl = files_list.clone();
+                let st = state.clone();
+                let ce = code_editor.clone();
+                let ol = outline_list.clone();
+                let to = toast_overlay.cloned();
+                let cd = collapsed_dirs.clone();
+
+                let gesture = GestureClick::new();
+                let fp_g = folder_path.clone();
+                let fl_g = fl.clone();
+                let st_g = st.clone();
+                let ce_g = ce.clone();
+                let ol_g = ol.clone();
+                let to_g = to.clone();
+                let cd_g = cd.clone();
+                gesture.connect_pressed(move |_, n_press, _, _| {
+                    if n_press == 1 {
+                        let mut set = cd_g.borrow_mut();
+                        if set.contains(&fp_g) {
+                            set.remove(&fp_g);
+                        } else {
+                            set.insert(fp_g.clone());
+                        }
+                        let collapsed_vec: Vec<PathBuf> = set.iter().cloned().collect();
+                        drop(set);
+
+                        let (p_dir, c_file) = {
+                            let s = st_g.borrow();
+                            (s.project_dir.clone(), s.current_file.clone())
+                        };
+                        let proj_sess = ProjectSession {
+                            current_file: Some(c_file),
+                            collapsed_dirs: collapsed_vec,
+                        };
+                        let _ = SessionManager::save_project_session(&p_dir, &proj_sess);
+
+                        Self::refresh_file_tree_impl(&fl_g, &st_g, &ce_g, &ol_g, to_g.as_ref(), &cd_g);
+                    }
+                });
+                click_target.add_controller(gesture);
+
+                let key_ctrl = EventControllerKey::new();
+                let fp_k = folder_path.clone();
+                let fl_k = fl.clone();
+                let st_k = st.clone();
+                let ce_k = ce.clone();
+                let ol_k = ol.clone();
+                let to_k = to.clone();
+                let cd_k = cd.clone();
+                key_ctrl.connect_key_pressed(move |_, key, _, _| {
+                    if key == Key::Return || key == Key::KP_Enter || key == Key::space {
+                        let mut set = cd_k.borrow_mut();
+                        if set.contains(&fp_k) {
+                            set.remove(&fp_k);
+                        } else {
+                            set.insert(fp_k.clone());
+                        }
+                        let collapsed_vec: Vec<PathBuf> = set.iter().cloned().collect();
+                        drop(set);
+
+                        let (p_dir, c_file) = {
+                            let s = st_k.borrow();
+                            (s.project_dir.clone(), s.current_file.clone())
+                        };
+                        let proj_sess = ProjectSession {
+                            current_file: Some(c_file),
+                            collapsed_dirs: collapsed_vec,
+                        };
+                        let _ = SessionManager::save_project_session(&p_dir, &proj_sess);
+
+                        Self::refresh_file_tree_impl(&fl_k, &st_k, &ce_k, &ol_k, to_k.as_ref(), &cd_k);
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                });
+                row.add_controller(key_ctrl);
+
+                row.set_child(Some(&hbox));
+                files_list.append(&row);
+
+                if !is_collapsed {
+                    Self::render_tree_items(
+                        &item.children,
+                        depth + 1,
+                        files_list,
+                        state,
+                        code_editor,
+                        outline_list,
+                        toast_overlay,
+                        collapsed_dirs,
+                    );
+                }
+            } else {
+                // File Row
+                let is_current = current_file == item.path;
+
+                // Indent spacer to align file icon with folder icon
+                let indent_spacer = Box::new(Orientation::Horizontal, 0);
+                indent_spacer.set_width_request(12);
+                click_target.append(&indent_spacer);
+
+                let file_icon = Image::from_icon_name(item.kind.icon_name());
+                click_target.append(&file_icon);
+
+                let label = Label::new(Some(&item.name));
+                label.set_xalign(0.0);
+                if is_current {
+                    label.add_css_class("heading");
+                    row.add_css_class("selected");
+                }
+                label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                click_target.append(&label);
+
+                hbox.append(&click_target);
+
+                // Delete button for file
+                let btn_del = Button::builder()
+                    .icon_name("user-trash-symbolic")
+                    .tooltip_text("Excluir arquivo...")
+                    .css_classes(["flat", "circular"])
+                    .build();
+
+                let pop_del = Popover::new();
+                pop_del.set_parent(&btn_del);
+
+                let del_box = Box::new(Orientation::Vertical, 8);
+                del_box.set_margin_start(10);
+                del_box.set_margin_end(10);
+                del_box.set_margin_top(8);
+                del_box.set_margin_bottom(8);
+
+                let del_title = Label::new(Some(&format!("Excluir '{}'?", item.name)));
+                del_title.add_css_class("heading");
+                del_title.set_xalign(0.0);
+                del_box.append(&del_title);
+
+                let del_msg = Label::new(Some("Esta ação não pode ser desfeita."));
+                del_msg.add_css_class("dim-label");
+                del_box.append(&del_msg);
+
+                let del_btns = Box::new(Orientation::Horizontal, 8);
+                let btn_cancel = Button::with_label("Cancelar");
+                let btn_confirm_del = Button::with_label("Excluir");
+                btn_confirm_del.add_css_class("destructive-action");
+                del_btns.append(&btn_cancel);
+                del_btns.append(&btn_confirm_del);
+                del_box.append(&del_btns);
+
+                pop_del.set_child(Some(&del_box));
+
+                let pop_del_clone = pop_del.clone();
+                btn_del.connect_clicked(move |_| {
+                    pop_del_clone.popup();
+                });
+
+                {
+                    let pop = pop_del.clone();
+                    btn_cancel.connect_clicked(move |_| {
+                        pop.popdown();
+                    });
+                }
+
+                {
+                    let pop = pop_del.clone();
+                    let target = item.path.clone();
+                    let name_str = item.name.clone();
+                    let fl = files_list.clone();
+                    let st = state.clone();
+                    let ce = code_editor.clone();
+                    let ol = outline_list.clone();
+                    let to = toast_overlay.cloned();
+                    let cd = collapsed_dirs.clone();
+                    btn_confirm_del.connect_clicked(move |_| {
+                        let is_current = {
+                            let s = st.borrow();
+                            s.current_file == target
+                        };
+                        let _ = std::fs::remove_file(&target);
+                        if let Some(ref t) = to {
+                            t.add_toast(Toast::new(&format!("Arquivo excluído: {}", name_str)));
+                        }
+                        pop.popdown();
+
+                        if is_current {
+                            let root = st.borrow().project_dir.clone();
+                            let main_path = root.join("main.tex");
+                            if main_path.exists() {
+                                Self::open_file_in_editor(&main_path, &st, &ce, &ol, to.as_ref());
+                            } else if let Some(another) = FileTreeScanner::scan_flat_files(&root)
+                                .into_iter()
+                                .find(|f| f.kind == FileKind::Latex)
+                            {
+                                Self::open_file_in_editor(&another.path, &st, &ce, &ol, to.as_ref());
+                            } else {
+                                ce.set_text_silently("");
+                            }
+                        }
+                        Self::refresh_file_tree_impl(&fl, &st, &ce, &ol, to.as_ref(), &cd);
+                    });
+                }
+
+                hbox.append(&btn_del);
+
+                // Clicking file opens in editor
+                let file_path = item.path.clone();
+                let st = state.clone();
+                let ce = code_editor.clone();
+                let ol = outline_list.clone();
+                let to = toast_overlay.cloned();
+
+                let gesture = GestureClick::new();
+                let fp_g = file_path.clone();
+                let st_g = st.clone();
+                let ce_g = ce.clone();
+                let ol_g = ol.clone();
+                let to_g = to.clone();
+                gesture.connect_pressed(move |_, n_press, _, _| {
+                    if n_press == 1 {
+                        Self::open_file_in_editor(&fp_g, &st_g, &ce_g, &ol_g, to_g.as_ref());
+                    }
+                });
+                click_target.add_controller(gesture);
+
+                let key_ctrl = EventControllerKey::new();
+                let fp_k = file_path.clone();
+                let st_k = st.clone();
+                let ce_k = ce.clone();
+                let ol_k = ol.clone();
+                let to_k = to.clone();
+                key_ctrl.connect_key_pressed(move |_, key, _, _| {
+                    if key == Key::Return || key == Key::KP_Enter {
+                        Self::open_file_in_editor(&fp_k, &st_k, &ce_k, &ol_k, to_k.as_ref());
+                        glib::Propagation::Stop
+                    } else {
+                        glib::Propagation::Proceed
+                    }
+                });
+                row.add_controller(key_ctrl);
+
+                row.set_child(Some(&hbox));
+                files_list.append(&row);
+            }
         }
     }
 
@@ -489,6 +1660,16 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
 
                     let offset = title_span.start;
                     let code_clone = code_editor.clone();
+
+                    let gesture = GestureClick::new();
+                    let code_g = code_clone.clone();
+                    gesture.connect_pressed(move |_, n_press, _, _| {
+                        if n_press == 1 {
+                            code_g.set_cursor_offset(offset);
+                        }
+                    });
+                    row.add_controller(gesture);
+
                     row.connect_activated(move |_| {
                         code_clone.set_cursor_offset(offset);
                     });
@@ -569,6 +1750,23 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             let code_clone = code_editor.clone();
             let state_clone = state.clone();
 
+            let gesture = GestureClick::new();
+            let key_g = key_clone.clone();
+            let code_g = code_clone.clone();
+            let state_g = state_clone.clone();
+            gesture.connect_pressed(move |_, n_press, _, _| {
+                if n_press == 1 {
+                    let cursor = code_g.get_cursor_offset();
+                    let delta = DocumentOperations::insert_citation(cursor, &key_g, ChangeOrigin::CodeEditor);
+                    let mut s = state_g.borrow_mut();
+                    if let Ok(_) = s.document.apply_delta(delta) {
+                        let updated = s.document.source().to_string();
+                        code_g.set_text_silently(&updated);
+                    }
+                }
+            });
+            row.add_controller(gesture);
+
             row.connect_activated(move |_| {
                 let cursor = code_clone.get_cursor_offset();
                 let delta = DocumentOperations::insert_citation(cursor, &key_clone, ChangeOrigin::CodeEditor);
@@ -593,14 +1791,29 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         outline_list: &ListBox,
         bib_list: &ListBox,
         btn_compile: &Button,
+        collapsed_dirs: &Rc<RefCell<HashSet<PathBuf>>>,
         new_dir: &Path,
     ) {
         if !new_dir.is_dir() {
             return;
         }
 
-        let main_file_rel = ProjectManager::detect_main_file(new_dir);
-        let main_file_path = new_dir.join(&main_file_rel);
+        // 1. Save and update last_project_dir
+        let mut global = SessionManager::load();
+        global.last_project_dir = Some(new_dir.to_path_buf());
+        let _ = SessionManager::save(&global);
+
+        let proj_session = SessionManager::load_project_session(new_dir, &global);
+
+        let main_file_path = if let Some(ref saved_file) = proj_session.current_file {
+            if saved_file.exists() && saved_file.is_file() {
+                saved_file.clone()
+            } else {
+                new_dir.join(ProjectManager::detect_main_file(new_dir))
+            }
+        } else {
+            new_dir.join(ProjectManager::detect_main_file(new_dir))
+        };
 
         let initial_text = if main_file_path.exists() {
             std::fs::read_to_string(&main_file_path).unwrap_or_else(|_| Self::default_initial_latex())
@@ -629,8 +1842,10 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             s.is_compiling = false;
         }
 
+        code_editor.spell_checker().set_project_dict(new_dir);
         code_editor.set_text_silently(&initial_text);
-        Self::refresh_file_tree_impl(files_list, state, code_editor, outline_list);
+        *collapsed_dirs.borrow_mut() = proj_session.collapsed_dirs.into_iter().collect();
+        Self::refresh_file_tree_impl(files_list, state, code_editor, outline_list, Some(toast_overlay), collapsed_dirs);
         Self::refresh_outline_impl(outline_list, state, code_editor);
         Self::refresh_bib_list_impl(bib_list, state, code_editor);
 
@@ -642,6 +1857,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         window.set_title(Some(&format!("VibeTeX — {}", dir_name)));
         toast_overlay.add_toast(Toast::new(&format!("Projeto aberto: {}", dir_name)));
 
+        let main_file_rel = ProjectManager::detect_main_file(new_dir);
         let cfg = ProjectConfig::new(&dir_name, &main_file_rel);
         let expected_pdf = CompilerRunner::get_pdf_path(new_dir, &cfg);
         if expected_pdf.exists() {
@@ -659,21 +1875,29 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         btn_undo: Button,
         btn_redo: Button,
         btn_new_proj: Button,
-        btn_export: Button,
+        pop_export: Popover,
+        btn_export_pdf: Button,
+        btn_export_zip: Button,
         btn_clear_logs: Button,
         btn_toggle_sidebar: Button,
-        btn_minimize_drawer: Button,
+        btn_toggle_logs: ToggleButton,
+        btn_close_drawer: Button,
+        btn_spell_status: Button,
+        bottom_drawer: Box,
         sidebar_box: Box,
         root_paned: Paned,
         editor_logs_paned: Paned,
         editor_pdf_paned: Paned,
-        log_scroll: ScrolledWindow,
         btn_mode_code: ToggleButton,
         btn_mode_visual: ToggleButton,
         btn_mode_split: ToggleButton,
     ) {
         // --- 1. View Mode Switching: [Código] [Ambos] [Visual] ---
-        let left_panel = editor_logs_paned.clone();
+        // Use the whole left column (editor + log drawer + status strip) so that
+        // nothing from the code side remains visible in PDF-only mode.
+        let left_panel: gtk4::Widget = editor_pdf_paned
+            .start_child()
+            .unwrap_or_else(|| editor_logs_paned.clone().upcast());
         let right_panel = self.pdf_viewer.widget().clone();
         let ws_paned = editor_pdf_paned.clone();
 
@@ -684,6 +1908,9 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                 if btn.is_active() {
                     left_p.set_visible(true);
                     right_p.set_visible(false);
+                    let mut g = SessionManager::load();
+                    g.view_mode = Some("code".to_string());
+                    let _ = SessionManager::save(&g);
                 }
             }
         });
@@ -695,6 +1922,9 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                 if btn.is_active() {
                     left_p.set_visible(false);
                     right_p.set_visible(true);
+                    let mut g = SessionManager::load();
+                    g.view_mode = Some("visual".to_string());
+                    let _ = SessionManager::save(&g);
                 }
             }
         });
@@ -708,9 +1938,25 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                     left_p.set_visible(true);
                     right_p.set_visible(true);
                     ws_p.set_position(570);
+                    let mut g = SessionManager::load();
+                    g.view_mode = Some("split".to_string());
+                    let _ = SessionManager::save(&g);
                 }
             }
         });
+
+        // Apply initial layout visibility based on active view mode
+        if btn_mode_code.is_active() {
+            left_panel.set_visible(true);
+            right_panel.set_visible(false);
+        } else if btn_mode_visual.is_active() {
+            left_panel.set_visible(false);
+            right_panel.set_visible(true);
+        } else {
+            left_panel.set_visible(true);
+            right_panel.set_visible(true);
+            ws_paned.set_position(570);
+        }
 
         // --- 2. Collapsible Sidebar ---
         let sidebar_ref = sidebar_box.clone();
@@ -731,27 +1977,37 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             }
         });
 
-        // --- 3. Minimizable & Resizable Logs Drawer ---
-        let is_drawer_minimized = Rc::new(Cell::new(false));
-        let saved_drawer_pos = Rc::new(Cell::new(580));
-        let log_scroll_ref = log_scroll.clone();
+        // --- 3. Zed-Style Debug / Logs Drawer Toggle & Close ---
+        let drawer_ref = bottom_drawer.clone();
         let logs_paned_ref = editor_logs_paned.clone();
-        let btn_min_ref = btn_minimize_drawer.clone();
+        let saved_drawer_pos = Rc::new(Cell::new(560));
+        let btn_toggle_ref = btn_toggle_logs.clone();
 
-        btn_minimize_drawer.connect_clicked(move |_| {
-            let is_min = is_drawer_minimized.get();
-            if is_min {
-                log_scroll_ref.set_visible(true);
-                btn_min_ref.set_icon_name("pan-down-symbolic");
-                btn_min_ref.set_tooltip_text(Some("Minimizar Painel de Logs"));
-                logs_paned_ref.set_position(saved_drawer_pos.get());
-                is_drawer_minimized.set(false);
-            } else {
-                saved_drawer_pos.set(logs_paned_ref.position());
-                log_scroll_ref.set_visible(false);
-                btn_min_ref.set_icon_name("pan-up-symbolic");
-                btn_min_ref.set_tooltip_text(Some("Expandir Painel de Logs"));
-                is_drawer_minimized.set(true);
+        btn_toggle_logs.connect_toggled({
+            let d = drawer_ref.clone();
+            let p = logs_paned_ref.clone();
+            let s = saved_drawer_pos.clone();
+            move |btn| {
+                let active = btn.is_active();
+                d.set_visible(active);
+                if active {
+                    p.set_position(s.get());
+                }
+            }
+        });
+
+        btn_close_drawer.connect_clicked({
+            let b = btn_toggle_ref.clone();
+            move |_| {
+                b.set_active(false);
+            }
+        });
+
+        let saved_pos_track = saved_drawer_pos.clone();
+        let drawer_vis_check = bottom_drawer.clone();
+        editor_logs_paned.connect_position_notify(move |paned| {
+            if drawer_vis_check.is_visible() && paned.position() > 100 {
+                saved_pos_track.set(paned.position());
             }
         });
 
@@ -765,6 +2021,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         let outline_ref_open = self.outline_list.clone();
         let bib_ref_open = self.bib_list.clone();
         let comp_ref_open = btn_compile.clone();
+        let collapsed_ref_open = self.collapsed_dirs.clone();
 
         let open_action = Rc::new(move || {
             let chooser = FileChooserNative::new(
@@ -785,6 +2042,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             let outline_c = outline_ref_open.clone();
             let bib_c = bib_ref_open.clone();
             let comp_c = comp_ref_open.clone();
+            let collapsed_c = collapsed_ref_open.clone();
 
             chooser.connect_response(move |dialog, response| {
                 if response == ResponseType::Accept {
@@ -800,6 +2058,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                                 &outline_c,
                                 &bib_c,
                                 &comp_c,
+                                &collapsed_c,
                                 &path,
                             );
                         }
@@ -815,17 +2074,208 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             open_click();
         });
 
-        // Global Window Keyboard Controller (Ctrl+O, Ctrl+S, Ctrl+B, Ctrl+Z, Ctrl+Y)
+        // --- 4. Export Actions (PDF and ZIP) ---
+        let win_pdf = self.window.clone();
+        let state_pdf = self.state.clone();
+        let toast_pdf = self.toast_overlay.clone();
+        let pop_pdf = pop_export.clone();
+
+        let export_pdf_action = Rc::new(move || {
+            pop_pdf.popdown();
+            let (proj_dir, dir_name) = {
+                let st = state_pdf.borrow();
+                let name = st
+                    .project_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("documento")
+                    .to_string();
+                (st.project_dir.clone(), name)
+            };
+
+            let main_file_rel = ProjectManager::detect_main_file(&proj_dir);
+            let cfg = ProjectConfig::new("VibeTeX Project", &main_file_rel);
+            let compiled_pdf = CompilerRunner::get_pdf_path(&proj_dir, &cfg);
+
+            if !compiled_pdf.exists() {
+                toast_pdf.add_toast(Toast::new(
+                    "Nenhum PDF compilado disponível. Compile o projeto primeiro (Ctrl+B).",
+                ));
+                return;
+            }
+
+            let default_name = format!("{}.pdf", dir_name);
+            let chooser = FileChooserNative::new(
+                Some("Exportar Documento PDF"),
+                Some(&win_pdf),
+                FileChooserAction::Save,
+                Some("Exportar"),
+                Some("Cancelar"),
+            );
+            chooser.set_modal(true);
+            chooser.set_current_name(&default_name);
+
+            let filter = FileFilter::new();
+            filter.set_name(Some("Documento PDF (*.pdf)"));
+            filter.add_mime_type("application/pdf");
+            filter.add_pattern("*.pdf");
+            chooser.add_filter(&filter);
+
+            let toast_c = toast_pdf.clone();
+            chooser.connect_response(move |dialog, response| {
+                if response == ResponseType::Accept {
+                    if let Some(target_file) = dialog.file() {
+                        if let Some(target_path) = target_file.path() {
+                            let final_path = if target_path.extension().map(|e| e == "pdf").unwrap_or(false) {
+                                target_path
+                            } else {
+                                target_path.with_extension("pdf")
+                            };
+
+                            match std::fs::copy(&compiled_pdf, &final_path) {
+                                Ok(_) => {
+                                    toast_c.add_toast(Toast::new(&format!(
+                                        "PDF exportado com sucesso: {}",
+                                        final_path.file_name().unwrap_or_default().to_string_lossy()
+                                    )));
+                                }
+                                Err(e) => {
+                                    toast_c.add_toast(Toast::new(&format!("Erro ao exportar PDF: {}", e)));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            chooser.show();
+        });
+
+        let exp_pdf_click = export_pdf_action.clone();
+        btn_export_pdf.connect_clicked(move |_| {
+            exp_pdf_click();
+        });
+
+        let exp_pdf_viewer = export_pdf_action.clone();
+        self.pdf_viewer.connect_export_pdf(move || {
+            exp_pdf_viewer();
+        });
+
+        let win_zip = self.window.clone();
+        let state_zip = self.state.clone();
+        let toast_zip = self.toast_overlay.clone();
+        let pop_zip = pop_export.clone();
+
+        let export_zip_action = Rc::new(move || {
+            pop_zip.popdown();
+            let (proj_dir, dir_name) = {
+                let st = state_zip.borrow();
+                let name = st
+                    .project_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("projeto_latex")
+                    .to_string();
+                (st.project_dir.clone(), name)
+            };
+
+            let default_name = format!("{}.zip", dir_name);
+            let chooser = FileChooserNative::new(
+                Some("Exportar Projeto LaTeX (.zip)"),
+                Some(&win_zip),
+                FileChooserAction::Save,
+                Some("Exportar"),
+                Some("Cancelar"),
+            );
+            chooser.set_modal(true);
+            chooser.set_current_name(&default_name);
+
+            let filter = FileFilter::new();
+            filter.set_name(Some("Arquivo ZIP (*.zip)"));
+            filter.add_mime_type("application/zip");
+            filter.add_pattern("*.zip");
+            chooser.add_filter(&filter);
+
+            let toast_c = toast_zip.clone();
+            chooser.connect_response(move |dialog, response| {
+                if response == ResponseType::Accept {
+                    if let Some(target_file) = dialog.file() {
+                        if let Some(target_path) = target_file.path() {
+                            let final_path = if target_path.extension().map(|e| e == "zip").unwrap_or(false) {
+                                target_path
+                            } else {
+                                target_path.with_extension("zip")
+                            };
+
+                            toast_c.add_toast(Toast::new("Compactando e exportando projeto para ZIP..."));
+
+                            let (sender, receiver) = async_channel::bounded(1);
+                            let proj_dir_thread = proj_dir.clone();
+                            let target_thread = final_path.clone();
+
+                            std::thread::spawn(move || {
+                                let res = ZipService::export_project(&proj_dir_thread, &target_thread);
+                                let _ = sender.send_blocking(res);
+                            });
+
+                            let toast_done = toast_c.clone();
+                            glib::spawn_future_local(async move {
+                                if let Ok(res) = receiver.recv().await {
+                                    match res {
+                                        Ok(_) => {
+                                            toast_done.add_toast(Toast::new(&format!(
+                                                "Projeto exportado com sucesso: {}",
+                                                final_path.file_name().unwrap_or_default().to_string_lossy()
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            toast_done.add_toast(Toast::new(&format!("Erro ao exportar ZIP: {}", e)));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+
+            chooser.show();
+        });
+
+        let exp_zip_click = export_zip_action.clone();
+        btn_export_zip.connect_clicked(move |_| {
+            exp_zip_click();
+        });
+
+        // Global Window Keyboard Controller (Ctrl+O, Ctrl+S, Ctrl+B, Ctrl+Z, Ctrl+Y, Ctrl+J, Ctrl+Shift+S, Ctrl+Shift+E)
         let key_controller = EventControllerKey::new();
         let open_key = open_action.clone();
         let btn_save_key = btn_save.clone();
         let btn_compile_key = btn_compile.clone();
         let btn_undo_key = btn_undo.clone();
         let btn_redo_key = btn_redo.clone();
+        let btn_toggle_key = btn_toggle_logs.clone();
+        let btn_spell_key = btn_spell_status.clone();
+        let exp_pdf_key = export_pdf_action.clone();
+        let exp_zip_key = export_zip_action.clone();
 
         key_controller.connect_key_pressed(move |_ctrl, keyval, _keycode, modifier| {
             let is_ctrl = modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-            if is_ctrl {
+            let is_shift = modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+
+            if is_ctrl && is_shift {
+                match keyval {
+                    Key::s | Key::S => {
+                        exp_pdf_key();
+                        glib::Propagation::Stop
+                    }
+                    Key::e | Key::E => {
+                        exp_zip_key();
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            } else if is_ctrl {
                 match keyval {
                     Key::o | Key::O => {
                         open_key();
@@ -847,8 +2297,15 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                         btn_redo_key.emit_clicked();
                         glib::Propagation::Stop
                     }
+                    Key::j | Key::J => {
+                        btn_toggle_key.set_active(!btn_toggle_key.is_active());
+                        glib::Propagation::Stop
+                    }
                     _ => glib::Propagation::Proceed,
                 }
+            } else if keyval == Key::F7 {
+                btn_spell_key.emit_clicked();
+                glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
             }
@@ -860,8 +2317,9 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         let pdf_comp = self.pdf_viewer.clone();
         let spinner_comp = self.spinner.clone();
         let status_comp = self.status_label.clone();
-        let log_comp = self.log_content.clone();
+        let log_comp = self.log_view.clone();
         let toast_comp = self.toast_overlay.clone();
+        let btn_toggle_comp = btn_toggle_logs.clone();
 
         let trigger_compile = Rc::new(move || {
             let (proj_dir, cur_file, content) = {
@@ -884,6 +2342,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
             let log_done = log_comp.clone();
             let pdf_done = pdf_comp.clone();
             let toast_done = toast_comp.clone();
+            let btn_toggle_done = btn_toggle_comp.clone();
             let proj_dir_thread = proj_dir.clone();
             let proj_dir_done = proj_dir.clone();
 
@@ -923,7 +2382,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                                 summary.page_count.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
                             );
                             status_done.set_text(&status_msg);
-                            log_done.set_text(&summary.raw_log);
+                            log_done.buffer().set_text(&summary.raw_log);
 
                             if summary.success {
                                 toast_done.add_toast(Toast::new("Compilação bem-sucedida!"));
@@ -934,13 +2393,16 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                                 }
                             } else {
                                 toast_done.add_toast(Toast::new("Houve erros durante a compilação."));
+                                // Automatically open debug drawer when errors occur
+                                btn_toggle_done.set_active(true);
                             }
                         }
                         Err(e) => {
                             let msg = format!("Falha ao executar compilador: {}", e);
                             status_done.set_text(&msg);
-                            log_done.set_text(&msg);
+                            log_done.buffer().set_text(&msg);
                             toast_done.add_toast(Toast::new(&msg));
+                            btn_toggle_done.set_active(true);
                         }
                     }
                 }
@@ -1027,6 +2489,9 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
 
             // 3. Schedule auto-compilation with debounce and completeness check
             auto_comp_code();
+
+            // 4. Schedule live spell-check with debounce
+            code_ref.schedule_spell_check();
         });
 
         // 7. Save Document
@@ -1071,45 +2536,14 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         });
 
         // 10. Clear Logs
-        let log_clear = self.log_content.clone();
+        let log_clear = self.log_view.clone();
         let status_clear = self.status_label.clone();
         btn_clear_logs.connect_clicked(move |_| {
-            log_clear.set_text("");
+            log_clear.buffer().set_text("");
             status_clear.set_text("Logs limpos.");
         });
 
-        // 11. Export to ZIP (Background thread: non-blocking and safe)
-        let state_zip = self.state.clone();
-        let toast_zip = self.toast_overlay.clone();
-        btn_export.connect_clicked(move |_| {
-            let st = state_zip.borrow();
-            let proj_dir = st.project_dir.clone();
-            let zip_path = proj_dir.join("projeto_vibetex.zip");
-            let toast_clone = toast_zip.clone();
 
-            toast_clone.add_toast(Toast::new("Exportando projeto para ZIP em segundo plano..."));
-
-            let (sender, receiver) = async_channel::bounded(1);
-            let zip_target = zip_path.clone();
-
-            std::thread::spawn(move || {
-                let res = ZipService::export_project(&proj_dir, &zip_target);
-                let _ = sender.send_blocking(res);
-            });
-
-            glib::spawn_future_local(async move {
-                if let Ok(res) = receiver.recv().await {
-                    match res {
-                        Ok(_) => {
-                            toast_clone.add_toast(Toast::new(&format!("Projeto exportado: {}", zip_path.display())));
-                        }
-                        Err(e) => {
-                            toast_clone.add_toast(Toast::new(&format!("Erro ao exportar ZIP: {}", e)));
-                        }
-                    }
-                }
-            });
-        });
 
         // 12. New Project from Template Dialog
         let toast_tmpl = self.toast_overlay.clone();
@@ -1119,6 +2553,7 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
         let files_tmpl = self.files_list.clone();
         let outline_tmpl = self.outline_list.clone();
         let bib_tmpl = self.bib_list.clone();
+        let collapsed_tmpl = self.collapsed_dirs.clone();
 
         btn_new_proj.connect_clicked(move |_| {
             if let Some(template) = TemplateCatalog::get("abnt") {
@@ -1128,7 +2563,15 @@ A sincronização utiliza intervalos de bytes exatos para aplicar deltas pontuai
                 if let Ok(content) = std::fs::read_to_string(&main_path) {
                     code_tmpl.set_text_silently(&content);
                     toast_tmpl.add_toast(Toast::new("Modelo ABNT aplicado com sucesso!"));
-                    Self::refresh_file_tree_impl(&files_tmpl, &state_tmpl, &code_tmpl, &outline_tmpl);
+                    collapsed_tmpl.borrow_mut().clear();
+                    Self::refresh_file_tree_impl(
+                        &files_tmpl,
+                        &state_tmpl,
+                        &code_tmpl,
+                        &outline_tmpl,
+                        Some(&toast_tmpl),
+                        &collapsed_tmpl,
+                    );
                     Self::refresh_outline_impl(&outline_tmpl, &state_tmpl, &code_tmpl);
                     Self::refresh_bib_list_impl(&bib_tmpl, &state_tmpl, &code_tmpl);
                     tc_tmpl();

@@ -14,7 +14,16 @@ fn main() -> glib::ExitCode {
         let project_dir = if args.len() > 1 {
             PathBuf::from(&args[1])
         } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            let session = vibetex_workspace::SessionManager::load();
+            if let Some(ref last_dir) = session.last_project_dir {
+                if last_dir.is_dir() {
+                    last_dir.clone()
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                }
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            }
         };
 
         let window = AppWindow::new(app, project_dir);

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 vibetex-core.workspace = true
+vibetex-spellcheck.workspace = true
 gtk4.workspace = true
 sourceview5.workspace = true
 glib.workspace = true

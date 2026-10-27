@@ -20,6 +20,7 @@ vibetex-templates.workspace = true
 vibetex-workspace.workspace = true
 vibetex-code-editor.workspace = true
 vibetex-visual-editor.workspace = true
+vibetex-spellcheck.workspace = true
 
 gtk4.workspace = true
 adw = { version = "0.9", package = "libadwaita" }

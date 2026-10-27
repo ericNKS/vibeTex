@@ -96,11 +96,33 @@ impl TexDetector {
 }
 
 fn which_binary(name: &str) -> Option<PathBuf> {
+    #[allow(unused_mut)]
+    let mut names = vec![name.to_string()];
+    #[cfg(windows)]
+    if !name.ends_with(".exe") {
+        names.push(format!("{}.exe", name));
+    }
+
+    // 1. Check directory next to current executable
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for n in &names {
+                let candidate = exe_dir.join(n);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // 2. Check PATH
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            for n in &names {
+                let candidate = dir.join(n);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
@@ -116,9 +138,11 @@ fn which_binary(name: &str) -> Option<PathBuf> {
     ];
 
     for dir in &fallbacks {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        for n in &names {
+            let candidate = PathBuf::from(dir).join(n);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
 
